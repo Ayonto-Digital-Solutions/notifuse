@@ -1,0 +1,46 @@
+# ═══════════════════════════════════════════════════════════════
+# Upstream-Sync: Ayonto-Fork von Notifuse
+# ═══════════════════════════════════════════════════════════════
+#
+# Merged taeglich Notifuse/notifuse (main) in ayonto-branding.
+# Der Image-BUILD laeuft NICHT hier, sondern im Repo
+# ayonto-newsletter (build-and-push.yml, taeglich 05:00 UTC) —
+# dessen GITHUB_TOKEN besitzt das GHCR-Paket ayonto-newsletter.
+#
+# Fork-Delta (bewusst minimal): pkg/mailer/translations.go
+# ("Notifuse" -> "Ayonto Pulse", System-Mail-Texte).
+#
+# Bei Merge-Konflikt schlaegt der Run fehl -> lokal aufloesen:
+#   git fetch upstream && git merge upstream/main && git push
+
+name: Upstream-Sync
+
+on:
+  schedule:
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ayonto-branding
+          fetch-depth: 0
+
+      - name: Upstream mergen
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Notifuse/notifuse.git
+          git fetch upstream main
+          if git merge upstream/main -m "Merge upstream/main"; then
+            git push origin ayonto-branding
+          else
+            echo "::error::Merge-Konflikt mit Upstream — lokal aufloesen: git fetch upstream && git merge upstream/main"
+            exit 1
+          fi
