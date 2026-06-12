@@ -1,0 +1,83 @@
+# ═══════════════════════════════════════════════════════════════
+# Upstream-Sync + Build: Ayonto-Fork von Notifuse
+# ═══════════════════════════════════════════════════════════════
+#
+# Ersetzt den frueheren Mirror-Workflow im Repo ayonto-newsletter.
+# Taeglich: Upstream (Notifuse/notifuse main) in ayonto-branding
+# mergen und das Image nach GHCR bauen. Watchtower auf dem Server
+# pullt ghcr.io/ayonto-digital-solutions/ayonto-newsletter:latest.
+#
+# Fork-Delta (bewusst minimal, damit Merges konfliktfrei bleiben):
+#   - pkg/mailer/translations.go: "Notifuse" -> "Ayonto Pulse"
+#     (System-Mail-Texte: Login-Code, Workspace-Einladung)
+#
+# Bei Merge-Konflikt schlaegt der Run fehl -> manuell aufloesen:
+#   git fetch upstream && git merge upstream/main
+#
+# AGPLv3: Dieser Fork ist oeffentlich — damit ist die Offenlegungs-
+# pflicht (§13) fuer die modifizierte, im Netz betriebene Version erfuellt.
+
+name: Upstream-Sync + Build nach GHCR
+
+on:
+  schedule:
+    - cron: "45 4 * * *"
+  workflow_dispatch:
+  push:
+    branches: [ayonto-branding]
+    paths-ignore:
+      - "**.md"
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/ayonto-digital-solutions/ayonto-newsletter
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ayonto-branding
+          fetch-depth: 0
+
+      - name: Upstream mergen (nur Schedule/Manuell)
+        if: github.event_name != 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Notifuse/notifuse.git
+          git fetch upstream main
+          if git merge upstream/main -m "Merge upstream/main [skip ci]"; then
+            git push origin ayonto-branding
+          else
+            echo "::error::Merge-Konflikt mit Upstream — lokal aufloesen: git fetch upstream && git merge upstream/main"
+            exit 1
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build-SHA ermitteln
+        id: vars
+        run: echo "short=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Image bauen + pushen
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/ayonto-digital-solutions/ayonto-newsletter:latest
+            ghcr.io/ayonto-digital-solutions/ayonto-newsletter:sha-${{ steps.vars.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
