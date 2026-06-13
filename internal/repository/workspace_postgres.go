@@ -481,6 +481,7 @@ func (r *workspaceRepository) CreateInvitation(ctx context.Context, invitation *
 		INSERT INTO workspace_invitations (id, workspace_id, inviter_id, email, permissions, expires_at, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (workspace_id, email) DO UPDATE SET
+			id = EXCLUDED.id,
 			inviter_id = EXCLUDED.inviter_id,
 			permissions = EXCLUDED.permissions,
 			expires_at = EXCLUDED.expires_at,
