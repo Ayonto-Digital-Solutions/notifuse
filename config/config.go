@@ -377,8 +377,9 @@ func LoadWithOptions(opts LoadOptions) (*Config, error) {
 	v.SetDefault("LOG_LEVEL", "info")
 	v.SetDefault("VERSION", VERSION)
 
-	// SMTP defaults
-	v.SetDefault("SMTP_FROM_NAME", "Notifuse")
+	// SMTP defaults — Ayonto-Fork: Default-Absendername gebrandet, damit
+	// System-Mails auch ohne DB-Setting / nach UI-Reinit "Ayonto Pulse" tragen
+	v.SetDefault("SMTP_FROM_NAME", "Ayonto Pulse")
 
 	// SMTP Bridge defaults (formerly SMTP Relay)
 	// NOTE: Don't set default for SMTP_BRIDGE_ENABLED - we need to detect when it's truly unset
