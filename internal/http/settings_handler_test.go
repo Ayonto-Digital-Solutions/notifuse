@@ -63,6 +63,10 @@ const testRootEmail = "root@example.com"
 const testSecretKey = "test-secret-key-32-bytes-long!!"
 
 func setupSettingsHandler(t *testing.T) (*SettingsHandler, *mockSettingRepository, *mockUserServiceForSettings, *mockAppShutdowner) {
+	return setupSettingsHandlerWithRootEmail(t, testRootEmail)
+}
+
+func setupSettingsHandlerWithRootEmail(t *testing.T, rootEmail string) (*SettingsHandler, *mockSettingRepository, *mockUserServiceForSettings, *mockAppShutdowner) {
 	t.Helper()
 
 	settingRepo := newMockSettingRepository()
@@ -89,7 +93,7 @@ func setupSettingsHandler(t *testing.T) (*SettingsHandler, *mockSettingRepositor
 		func() ([]byte, error) { return []byte("test-jwt-secret"), nil },
 		logger.NewLogger(),
 		testSecretKey,
-		testRootEmail,
+		rootEmail,
 		shutdowner,
 	)
 
@@ -148,6 +152,47 @@ func TestSettingsHandler_Get_Forbidden_NonRootUser(t *testing.T) {
 
 	handler.handleGet(w, req)
 	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestSettingsHandler_Get_MultipleRootEmails(t *testing.T) {
+	handler, settingRepo, userSvc, _ := setupSettingsHandlerWithRootEmail(t, testRootEmail+",second@example.com")
+
+	ctx := context.Background()
+	_ = settingRepo.Set(ctx, "is_installed", "true")
+	_ = settingRepo.Set(ctx, "root_email", testRootEmail+",second@example.com")
+
+	// A second listed root user.
+	userSvc.users["second-root-id"] = &domain.User{
+		ID:    "second-root-id",
+		Email: "second@example.com",
+	}
+
+	t.Run("second listed root is allowed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/settings.get", nil)
+		req = reqWithUserContext(req, "second-root-id")
+		w := httptest.NewRecorder()
+
+		handler.handleGet(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+	})
+
+	t.Run("first listed root is still allowed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/settings.get", nil)
+		req = reqWithUserContext(req, "root-user-id")
+		w := httptest.NewRecorder()
+
+		handler.handleGet(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+	})
+
+	t.Run("non-listed user is forbidden", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/settings.get", nil)
+		req = reqWithUserContext(req, "other-user-id")
+		w := httptest.NewRecorder()
+
+		handler.handleGet(w, req)
+		assert.Equal(t, http.StatusForbidden, w.Code)
+	})
 }
 
 func TestSettingsHandler_Get_Success(t *testing.T) {
@@ -276,6 +321,154 @@ func TestSettingsHandler_Get_EnvOverrides(t *testing.T) {
 	assert.True(t, response.EnvOverrides["smtp_port"])
 	assert.False(t, response.EnvOverrides["api_endpoint"])
 	assert.False(t, response.EnvOverrides["smtp_password"])
+}
+
+// When ROOT_EMAIL is set via env var, the displayed value must reflect the live
+// resolved config (which prefers the env var), not the value persisted to the DB at
+// install time. Simulates an operator adding a second root email and restarting: the
+// DB setting still holds only the original email, but the panel must show both.
+func TestSettingsHandler_Get_EnvOverride_UsesLiveRootEmail(t *testing.T) {
+	const resolvedRootEmails = "root@example.com,second@example.com"
+
+	settingRepo := newMockSettingRepository()
+	settingService := service.NewSettingService(settingRepo)
+	userSvc := newMockUserServiceForSettings()
+	shutdowner := newMockAppShutdowner()
+
+	// Env var is set (override detected) and carries the full, up-to-date list.
+	envConfig := &service.EnvironmentConfig{RootEmail: resolvedRootEmails}
+	userRepo := newMockUserRepository()
+	setupService := service.NewSetupService(
+		settingService,
+		&service.UserService{},
+		userRepo,
+		logger.NewLogger(),
+		testSecretKey,
+		nil,
+		envConfig,
+	)
+
+	// h.rootEmail mirrors config.RootEmail (env wins) — the value the app uses for auth.
+	handler := NewSettingsHandler(
+		setupService,
+		settingService,
+		userSvc,
+		func() ([]byte, error) { return []byte("test-jwt-secret"), nil },
+		logger.NewLogger(),
+		testSecretKey,
+		resolvedRootEmails,
+		shutdowner,
+	)
+
+	userSvc.users["root-user-id"] = &domain.User{ID: "root-user-id", Email: testRootEmail}
+
+	ctx := context.Background()
+	_ = settingRepo.Set(ctx, "is_installed", "true")
+	// Stale DB value frozen at install time (only the first email).
+	_ = settingRepo.Set(ctx, "root_email", testRootEmail)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/settings.get", nil)
+	req = reqWithUserContext(req, "root-user-id")
+	w := httptest.NewRecorder()
+
+	handler.handleGet(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var response SystemSettingsResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&response))
+
+	// Must surface the live resolved value, not the stale DB setting.
+	assert.Equal(t, resolvedRootEmails, response.Settings.RootEmail)
+	assert.True(t, response.EnvOverrides["root_email"])
+}
+
+// Every env-overridden field (not just root_email) must display the live env value
+// instead of the value persisted to the DB at install time, and secrets must stay
+// masked even when sourced from the env override.
+func TestSettingsHandler_Get_EnvOverride_AllFieldsUseLiveValues(t *testing.T) {
+	settingRepo := newMockSettingRepository()
+	settingService := service.NewSettingService(settingRepo)
+	userSvc := newMockUserServiceForSettings()
+	shutdowner := newMockAppShutdowner()
+
+	envConfig := &service.EnvironmentConfig{
+		RootEmail:               "env-root@example.com",
+		APIEndpoint:             "https://env.example.com",
+		SMTPHost:                "env-smtp.example.com",
+		SMTPPort:                465,
+		SMTPUsername:            "env-user",
+		SMTPPassword:            "env-secret",
+		SMTPFromEmail:           "env-from@example.com",
+		SMTPFromName:            "Env Sender",
+		SMTPUseTLS:              "false", // explicit false must beat DB "true"
+		SMTPEHLOHostname:        "ehlo.env.example.com",
+		SMTPBridgeEnabled:       "true",
+		SMTPBridgeDomain:        "bridge.env.example.com",
+		SMTPBridgePort:          2525,
+		SMTPBridgeTLSCertBase64: "env-cert",
+		SMTPBridgeTLSKeyBase64:  "env-key",
+	}
+	userRepo := newMockUserRepository()
+	setupService := service.NewSetupService(
+		settingService,
+		&service.UserService{},
+		userRepo,
+		logger.NewLogger(),
+		testSecretKey,
+		nil,
+		envConfig,
+	)
+	handler := NewSettingsHandler(
+		setupService,
+		settingService,
+		userSvc,
+		func() ([]byte, error) { return []byte("test-jwt-secret"), nil },
+		logger.NewLogger(),
+		testSecretKey,
+		envConfig.RootEmail,
+		shutdowner,
+	)
+	// Root user's email must match the env-configured root for authorization.
+	userSvc.users["root-user-id"] = &domain.User{ID: "root-user-id", Email: "env-root@example.com"}
+
+	ctx := context.Background()
+	_ = settingRepo.Set(ctx, "is_installed", "true")
+	// Stale DB values that must be shadowed by the env overrides.
+	_ = settingRepo.Set(ctx, "root_email", "db-root@example.com")
+	_ = settingRepo.Set(ctx, "smtp_host", "db-smtp.example.com")
+	_ = settingRepo.Set(ctx, "smtp_port", "25")
+	_ = settingRepo.Set(ctx, "smtp_use_tls", "true")
+	_ = settingRepo.Set(ctx, "smtp_bridge_domain", "db-bridge.example.com")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/settings.get", nil)
+	req = reqWithUserContext(req, "root-user-id")
+	w := httptest.NewRecorder()
+
+	handler.handleGet(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var response SystemSettingsResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&response))
+
+	s := response.Settings
+	assert.Equal(t, "env-root@example.com", s.RootEmail)
+	assert.Equal(t, "https://env.example.com", s.APIEndpoint)
+	assert.Equal(t, "env-smtp.example.com", s.SMTPHost)
+	assert.Equal(t, 465, s.SMTPPort)
+	assert.Equal(t, "env-user", s.SMTPUsername)
+	assert.Equal(t, "env-from@example.com", s.SMTPFromEmail)
+	assert.Equal(t, "Env Sender", s.SMTPFromName)
+	assert.False(t, s.SMTPUseTLS) // env "false" beats DB "true"
+	assert.Equal(t, "ehlo.env.example.com", s.SMTPEHLOHostname)
+	assert.True(t, s.SMTPBridgeEnabled)
+	assert.Equal(t, "bridge.env.example.com", s.SMTPBridgeDomain)
+	assert.Equal(t, 2525, s.SMTPBridgePort)
+
+	// Secrets sourced from env must be masked, never returned in the clear.
+	assert.Equal(t, passwordMask, s.SMTPPassword)
+	assert.NotEqual(t, "env-secret", s.SMTPPassword)
+	assert.Equal(t, configuredMask, s.SMTPBridgeTLSCertBase64)
+	assert.Equal(t, configuredMask, s.SMTPBridgeTLSKeyBase64)
 }
 
 // ============================================================

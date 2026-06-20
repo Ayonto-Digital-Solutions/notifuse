@@ -117,6 +117,17 @@ func TestWorkspaceService_ListWorkspaces(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Empty(t, workspaces)
 	})
+
+	t.Run("platform admin lists every workspace via repo.List", func(t *testing.T) {
+		// A ROOT_EMAIL user bypasses the membership scan and gets all workspaces.
+		rootUser := &domain.User{ID: "root-user", Email: "test@example.com"}
+		mockAuthService.EXPECT().AuthenticateUserFromContext(ctx).Return(rootUser, nil)
+		mockRepo.EXPECT().List(ctx).Return([]*domain.Workspace{{ID: "1"}, {ID: "2"}, {ID: "3"}}, nil)
+
+		workspaces, err := service.ListWorkspaces(ctx)
+		assert.NoError(t, err)
+		assert.Len(t, workspaces, 3)
+	})
 }
 
 func TestWorkspaceService_GetWorkspace(t *testing.T) {
@@ -174,14 +185,9 @@ func TestWorkspaceService_GetWorkspace(t *testing.T) {
 			Name: "Test Workspace",
 		}
 
-		expectedUserWorkspace := &domain.UserWorkspace{
-			UserID:      userID,
-			WorkspaceID: workspaceID,
-			Role:        "owner",
-		}
-
+		// GetWorkspace relies on AuthenticateUserForWorkspace for access; it no longer
+		// re-reads GetUserWorkspace (platform admins pass via the override).
 		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(expectedWorkspace, nil)
 
 		workspace, err := service.GetWorkspace(ctx, workspaceID)
@@ -189,18 +195,13 @@ func TestWorkspaceService_GetWorkspace(t *testing.T) {
 		assert.Equal(t, expectedWorkspace, workspace)
 	})
 
-	t.Run("workspace not found", func(t *testing.T) {
-		expectedUser := &domain.User{
-			ID: userID,
-		}
-
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(nil, assert.AnError)
+	t.Run("error authenticating user", func(t *testing.T) {
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, nil, nil, assert.AnError)
 
 		workspace, err := service.GetWorkspace(ctx, workspaceID)
 		require.Error(t, err)
 		assert.Nil(t, workspace)
-		assert.Equal(t, assert.AnError, err)
+		assert.ErrorIs(t, err, assert.AnError)
 	})
 
 	t.Run("error getting workspace by ID", func(t *testing.T) {
@@ -208,14 +209,7 @@ func TestWorkspaceService_GetWorkspace(t *testing.T) {
 			ID: userID,
 		}
 
-		expectedUserWorkspace := &domain.UserWorkspace{
-			UserID:      userID,
-			WorkspaceID: workspaceID,
-			Role:        "owner",
-		}
-
 		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(nil, assert.AnError)
 
 		workspace, err := service.GetWorkspace(ctx, workspaceID)
@@ -523,6 +517,107 @@ func TestWorkspaceService_CreateWorkspace(t *testing.T) {
 		require.Error(t, err)
 		assert.Nil(t, workspace)
 		assert.Contains(t, err.Error(), "workspace already exists")
+	})
+}
+
+func TestWorkspaceService_CreateWorkspace_MultipleRootEmails(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockWorkspaceRepository(ctrl)
+	mockUserRepo := mocks.NewMockUserRepository(ctrl)
+	mockTaskRepo := mocks.NewMockTaskRepository(ctrl)
+	mockLogger := pkgmocks.NewMockLogger(ctrl)
+	mockUserService := mocks.NewMockUserServiceInterface(ctrl)
+	mockAuthService := mocks.NewMockAuthService(ctrl)
+	mockMailer := pkgmocks.NewMockMailer(ctrl)
+	// Two configured root users (comma-separated).
+	mockConfig := &config.Config{RootEmail: "root1@example.com,root2@example.com"}
+	mockContactService := mocks.NewMockContactService(ctrl)
+	mockListService := mocks.NewMockListService(ctrl)
+	mockContactListService := mocks.NewMockContactListService(ctrl)
+	mockTemplateService := mocks.NewMockTemplateService(ctrl)
+	mockWebhookRegService := mocks.NewMockWebhookRegistrationService(ctrl)
+
+	service := NewWorkspaceService(
+		mockRepo,
+		mockUserRepo,
+		mockTaskRepo,
+		mockLogger,
+		mockUserService,
+		mockAuthService,
+		mockMailer,
+		mockConfig,
+		mockContactService,
+		mockListService,
+		mockContactListService,
+		mockTemplateService,
+		mockWebhookRegService,
+		"secret_key",
+		&SupabaseService{},
+		&DNSVerificationService{},
+		&BlogService{},
+	)
+
+	mockLogger.EXPECT().WithField(gomock.Any(), gomock.Any()).Return(mockLogger).AnyTimes()
+	mockLogger.EXPECT().Error(gomock.Any()).AnyTimes()
+	mockLogger.EXPECT().Info(gomock.Any()).AnyTimes()
+
+	ctx := context.Background()
+
+	t.Run("second listed root can create a workspace", func(t *testing.T) {
+		workspaceID := "secondroot"
+		secondRoot := &domain.User{ID: "root2", Email: "root2@example.com", Name: "Second Root"}
+
+		mockAuthService.EXPECT().AuthenticateUserFromContext(ctx).Return(secondRoot, nil)
+		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(nil, nil)
+		mockRepo.EXPECT().Create(ctx, gomock.Any()).Return(nil)
+		mockRepo.EXPECT().AddUserToWorkspace(ctx, gomock.Any()).Return(nil)
+		mockUserService.EXPECT().GetUserByID(ctx, secondRoot.ID).Return(secondRoot, nil)
+		mockContactService.EXPECT().UpsertContact(ctx, workspaceID, gomock.Any()).Return(domain.UpsertContactOperation{Action: domain.UpsertContactOperationCreate})
+		mockListService.EXPECT().CreateList(ctx, workspaceID, gomock.Any()).Return(nil)
+		mockListService.EXPECT().SubscribeToLists(ctx, gomock.Any(), true).Return(nil)
+		mockTaskRepo.EXPECT().List(ctx, workspaceID, gomock.Any()).Return([]*domain.Task{}, 0, nil).AnyTimes()
+		mockTaskRepo.EXPECT().Create(ctx, workspaceID, gomock.Any()).Return(nil).AnyTimes()
+
+		workspace, err := service.CreateWorkspace(ctx, workspaceID, "Second Root Workspace", "https://example.com", "https://example.com/logo.png", "https://example.com/cover.png", "UTC", domain.FileManagerSettings{
+			Endpoint:  "https://s3.amazonaws.com",
+			Bucket:    "my-bucket",
+			AccessKey: "AKIAIOSFODNN7EXAMPLE",
+		}, "en", []string{"en"})
+		require.NoError(t, err)
+		assert.Equal(t, workspaceID, workspace.ID)
+	})
+
+	t.Run("non-listed user is rejected", func(t *testing.T) {
+		outsider := &domain.User{ID: "outsider", Email: "outsider@example.com", Name: "Outsider"}
+		mockAuthService.EXPECT().AuthenticateUserFromContext(ctx).Return(outsider, nil)
+
+		workspace, err := service.CreateWorkspace(ctx, "outsiderws", "Outsider Workspace", "https://example.com", "https://example.com/logo.png", "https://example.com/cover.png", "UTC", domain.FileManagerSettings{
+			Endpoint:  "https://s3.amazonaws.com",
+			Bucket:    "my-bucket",
+			AccessKey: "AKIAIOSFODNN7EXAMPLE",
+		}, "en", []string{"en"})
+		require.Error(t, err)
+		assert.Nil(t, workspace)
+		var unauthorized *domain.ErrUnauthorized
+		assert.ErrorAs(t, err, &unauthorized)
+	})
+
+	t.Run("case-sensitive mismatch is rejected", func(t *testing.T) {
+		// "Root1@example.com" differs in case from the configured "root1@example.com".
+		mixedCase := &domain.User{ID: "mixed", Email: "Root1@example.com", Name: "Mixed Case"}
+		mockAuthService.EXPECT().AuthenticateUserFromContext(ctx).Return(mixedCase, nil)
+
+		workspace, err := service.CreateWorkspace(ctx, "mixedws", "Mixed Workspace", "https://example.com", "https://example.com/logo.png", "https://example.com/cover.png", "UTC", domain.FileManagerSettings{
+			Endpoint:  "https://s3.amazonaws.com",
+			Bucket:    "my-bucket",
+			AccessKey: "AKIAIOSFODNN7EXAMPLE",
+		}, "en", []string{"en"})
+		require.Error(t, err)
+		assert.Nil(t, workspace)
+		var unauthorized *domain.ErrUnauthorized
+		assert.ErrorAs(t, err, &unauthorized)
 	})
 }
 
@@ -1201,8 +1296,7 @@ func TestWorkspaceService_UpdateWorkspace(t *testing.T) {
 			UpdatedAt: time.Now(),
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(existingWorkspace, nil)
 		mockRepo.EXPECT().Update(ctx, gomock.Any()).Return(nil)
 
@@ -1261,41 +1355,12 @@ func TestWorkspaceService_UpdateWorkspace(t *testing.T) {
 			},
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 
 		workspace, err := service.UpdateWorkspace(ctx, workspaceID, "Updated Workspace", settings)
 		require.Error(t, err)
 		assert.Nil(t, workspace)
 		assert.IsType(t, &domain.ErrUnauthorized{}, err)
-	})
-
-	t.Run("error getting user workspace", func(t *testing.T) {
-		expectedUser := &domain.User{
-			ID: userID,
-		}
-
-		settings := domain.WorkspaceSettings{
-			WebsiteURL:      "https://example.com",
-			LogoURL:         "https://example.com/logo.png",
-			CoverURL:        "https://example.com/cover.png",
-			Timezone:        "UTC",
-			DefaultLanguage: "en",
-			Languages:       []string{"en"},
-			FileManager: domain.FileManagerSettings{
-				Endpoint:  "https://s3.amazonaws.com",
-				Bucket:    "my-bucket",
-				AccessKey: "AKIAIOSFODNN7EXAMPLE",
-			},
-		}
-
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(nil, assert.AnError)
-
-		workspace, err := service.UpdateWorkspace(ctx, workspaceID, "Updated Workspace", settings)
-		require.Error(t, err)
-		assert.Nil(t, workspace)
-		assert.Equal(t, assert.AnError, err)
 	})
 
 	t.Run("preserves custom field labels and ignores request labels", func(t *testing.T) {
@@ -1346,8 +1411,7 @@ func TestWorkspaceService_UpdateWorkspace(t *testing.T) {
 			UpdatedAt: time.Now().Add(-24 * time.Hour),
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(existingWorkspace, nil)
 		mockRepo.EXPECT().Update(ctx, gomock.Any()).DoAndReturn(func(ctx context.Context, workspace *domain.Workspace) error {
 			// Existing labels preserved, request labels ignored.
@@ -1399,8 +1463,7 @@ func TestWorkspaceService_UpdateWorkspace(t *testing.T) {
 			UpdatedAt: time.Now().Add(-24 * time.Hour),
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(existingWorkspace, nil)
 		mockRepo.EXPECT().Update(ctx, gomock.Any()).DoAndReturn(func(ctx context.Context, workspace *domain.Workspace) error {
 			// Existing blog config preserved, request blog fields ignored.
@@ -1457,8 +1520,7 @@ func TestWorkspaceService_UpdateWorkspace(t *testing.T) {
 			Languages:       []string{"en"},
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(existingWorkspace, nil)
 		mockRepo.EXPECT().Update(ctx, gomock.Any()).DoAndReturn(func(ctx context.Context, workspace *domain.Workspace) error {
 			// Verify template blocks are preserved
@@ -1524,8 +1586,7 @@ func TestWorkspaceService_UpdateWorkspace(t *testing.T) {
 			TemplateBlocks:  newTemplateBlocks,
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(existingWorkspace, nil)
 		mockRepo.EXPECT().Update(ctx, gomock.Any()).DoAndReturn(func(ctx context.Context, workspace *domain.Workspace) error {
 			// Verify template blocks were updated
@@ -1611,8 +1672,7 @@ func TestWorkspaceService_DeleteWorkspace(t *testing.T) {
 			Integrations: []domain.Integration{},
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(userWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, userWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(workspace, nil)
 		mockTaskRepo.EXPECT().DeleteAll(ctx, workspaceID).Return(nil)
 		mockRepo.EXPECT().Delete(ctx, workspaceID).Return(nil)
@@ -1659,14 +1719,12 @@ func TestWorkspaceService_DeleteWorkspace(t *testing.T) {
 		}
 
 		// Initial authentication for the DeleteWorkspace itself
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(userWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, userWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(workspace, nil)
 
 		// For each DeleteIntegration call inside DeleteWorkspace, expect these mocks
 		// The DeleteIntegration method will call AuthenticateUserForWorkspace again for each integration
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil).Times(2)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(userWorkspace, nil).Times(2)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, userWorkspace, nil).Times(2)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(workspace, nil).Times(2)
 
 		// No webhook operations expected for SMTP integrations
@@ -1714,13 +1772,11 @@ func TestWorkspaceService_DeleteWorkspace(t *testing.T) {
 		}
 
 		// Initial authentication for DeleteWorkspace
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(userWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, userWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(workspace, nil)
 
 		// Authentication for DeleteIntegration
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(userWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, userWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(workspace, nil)
 
 		// No webhook operations expected for SMTP integrations
@@ -1746,8 +1802,7 @@ func TestWorkspaceService_DeleteWorkspace(t *testing.T) {
 			Role:        "member", // Not an owner
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(userWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, userWorkspace, nil)
 
 		err := service.DeleteWorkspace(ctx, workspaceID)
 		require.Error(t, err)
@@ -1765,8 +1820,7 @@ func TestWorkspaceService_DeleteWorkspace(t *testing.T) {
 			Role:        "owner",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(userWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, userWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(nil, errors.New("error getting workspace"))
 
 		err := service.DeleteWorkspace(ctx, workspaceID)
@@ -1852,8 +1906,7 @@ func TestWorkspaceService_CreateIntegration(t *testing.T) {
 			Name: "Test Workspace",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(expectedWorkspace, nil)
 		mockRepo.EXPECT().Update(ctx, gomock.Any()).DoAndReturn(func(ctx context.Context, workspace *domain.Workspace) error {
 			// Verify the integration was added to the workspace
@@ -1889,8 +1942,7 @@ func TestWorkspaceService_CreateIntegration(t *testing.T) {
 			Role:        "member",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 
 		integrationID, err := service.CreateIntegration(ctx, domain.CreateIntegrationRequest{
 			WorkspaceID: workspaceID,
@@ -1914,8 +1966,7 @@ func TestWorkspaceService_CreateIntegration(t *testing.T) {
 			Role:        "owner",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(nil, errors.New("workspace not found"))
 
 		integrationID, err := service.CreateIntegration(ctx, domain.CreateIntegrationRequest{
@@ -1945,8 +1996,7 @@ func TestWorkspaceService_CreateIntegration(t *testing.T) {
 			Name: "Test Workspace",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(expectedWorkspace, nil)
 		mockRepo.EXPECT().Update(ctx, gomock.Any()).Return(errors.New("update error"))
 
@@ -1977,8 +2027,7 @@ func TestWorkspaceService_CreateIntegration(t *testing.T) {
 			Name: "Test Workspace",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(expectedWorkspace, nil)
 		mockRepo.EXPECT().Update(ctx, gomock.Any()).DoAndReturn(func(ctx context.Context, workspace *domain.Workspace) error {
 			// Verify the integration was added to the workspace
@@ -2107,8 +2156,7 @@ func TestWorkspaceService_UpdateIntegration(t *testing.T) {
 			Integrations: []domain.Integration{existingIntegration},
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(expectedWorkspace, nil)
 		mockRepo.EXPECT().Update(ctx, gomock.Any()).DoAndReturn(func(ctx context.Context, workspace *domain.Workspace) error {
 			// Verify the integration was updated in the workspace
@@ -2145,8 +2193,7 @@ func TestWorkspaceService_UpdateIntegration(t *testing.T) {
 			Role:        "member",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 
 		err := service.UpdateIntegration(ctx, domain.UpdateIntegrationRequest{
 			WorkspaceID:   workspaceID,
@@ -2175,8 +2222,7 @@ func TestWorkspaceService_UpdateIntegration(t *testing.T) {
 			Name: "Test Workspace",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(expectedWorkspace, nil)
 
 		err := service.UpdateIntegration(ctx, domain.UpdateIntegrationRequest{
@@ -2220,8 +2266,7 @@ func TestWorkspaceService_UpdateIntegration(t *testing.T) {
 			Integrations: []domain.Integration{existingIntegration},
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(expectedWorkspace, nil)
 		mockRepo.EXPECT().Update(ctx, gomock.Any()).DoAndReturn(func(ctx context.Context, workspace *domain.Workspace) error {
 			// Verify the integration was updated
@@ -2278,8 +2323,7 @@ func TestWorkspaceService_UpdateIntegration(t *testing.T) {
 			Integrations: []domain.Integration{existingIntegration},
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(expectedWorkspace, nil)
 		mockRepo.EXPECT().Update(ctx, gomock.Any()).DoAndReturn(func(ctx context.Context, workspace *domain.Workspace) error {
 			// Verify the integration was updated
@@ -2392,8 +2436,7 @@ func TestWorkspaceService_DeleteIntegration(t *testing.T) {
 			Integrations: []domain.Integration{existingIntegration},
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(expectedWorkspace, nil)
 
 		// No webhook operations expected for SMTP provider
@@ -2422,8 +2465,7 @@ func TestWorkspaceService_DeleteIntegration(t *testing.T) {
 			Role:        "member",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 
 		err := service.DeleteIntegration(ctx, workspaceID, integrationID)
 		require.Error(t, err)
@@ -2447,8 +2489,7 @@ func TestWorkspaceService_DeleteIntegration(t *testing.T) {
 			Name: "Test Workspace",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(expectedWorkspace, nil)
 
 		err := service.DeleteIntegration(ctx, workspaceID, integrationID)
@@ -2490,8 +2531,7 @@ func TestWorkspaceService_DeleteIntegration(t *testing.T) {
 			Integrations: []domain.Integration{existingIntegration},
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(expectedWorkspace, nil)
 
 		// No webhook operations expected for SMTP provider
@@ -2534,8 +2574,7 @@ func TestWorkspaceService_DeleteIntegration(t *testing.T) {
 			Integrations: []domain.Integration{existingIntegration},
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, userID, workspaceID).Return(expectedUserWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, expectedUser, expectedUserWorkspace, nil)
 		mockRepo.EXPECT().GetByID(ctx, workspaceID).Return(expectedWorkspace, nil)
 
 		// No webhook operations expected for SMTP provider
@@ -2603,8 +2642,7 @@ func TestWorkspaceService_RemoveMember(t *testing.T) {
 			Role:        "owner",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, ownerID, workspaceID).Return(ownerWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, ownerWorkspace, nil)
 		mockUserService.EXPECT().GetUserByID(ctx, memberID).Return(member, nil)
 		mockRepo.EXPECT().RemoveUserFromWorkspace(ctx, memberID, workspaceID).Return(nil)
 
@@ -2621,8 +2659,7 @@ func TestWorkspaceService_RemoveMember(t *testing.T) {
 			Role:        "owner",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, ownerID, workspaceID).Return(ownerWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, ownerWorkspace, nil)
 		mockUserService.EXPECT().GetUserByID(ctx, apiKeyID).Return(apiKeyUser, nil)
 		mockRepo.EXPECT().RemoveUserFromWorkspace(ctx, apiKeyID, workspaceID).Return(nil)
 		mockUserRepo.EXPECT().Delete(ctx, apiKeyID).Return(nil)
@@ -2649,8 +2686,7 @@ func TestWorkspaceService_RemoveMember(t *testing.T) {
 			Role:        "member",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, member, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, memberID, workspaceID).Return(memberWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, member, memberWorkspace, nil)
 		mockLogger.EXPECT().WithField("workspace_id", workspaceID).Return(mockLogger)
 		mockLogger.EXPECT().WithField("user_id", memberID).Return(mockLogger)
 		mockLogger.EXPECT().WithField("requester_id", memberID).Return(mockLogger)
@@ -2670,8 +2706,7 @@ func TestWorkspaceService_RemoveMember(t *testing.T) {
 			Role:        "owner",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, ownerID, workspaceID).Return(ownerWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, ownerWorkspace, nil)
 		mockLogger.EXPECT().WithField("workspace_id", workspaceID).Return(mockLogger)
 		mockLogger.EXPECT().WithField("user_id", ownerID).Return(mockLogger)
 		mockLogger.EXPECT().Error("Cannot remove self from workspace")
@@ -2679,22 +2714,6 @@ func TestWorkspaceService_RemoveMember(t *testing.T) {
 		err := service.RemoveMember(ctx, workspaceID, ownerID)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "cannot remove yourself from the workspace")
-	})
-
-	t.Run("error getting requester workspace", func(t *testing.T) {
-		owner := &domain.User{ID: ownerID, Type: domain.UserTypeUser}
-
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, ownerID, workspaceID).Return(nil, errors.New("repo error"))
-		mockLogger.EXPECT().WithField("workspace_id", workspaceID).Return(mockLogger)
-		mockLogger.EXPECT().WithField("user_id", memberID).Return(mockLogger)
-		mockLogger.EXPECT().WithField("requester_id", ownerID).Return(mockLogger)
-		mockLogger.EXPECT().WithField("error", "repo error").Return(mockLogger)
-		mockLogger.EXPECT().Error("Failed to get requester workspace")
-
-		err := service.RemoveMember(ctx, workspaceID, memberID)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "repo error")
 	})
 
 	t.Run("error getting user details", func(t *testing.T) {
@@ -2705,8 +2724,7 @@ func TestWorkspaceService_RemoveMember(t *testing.T) {
 			Role:        "owner",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, ownerID, workspaceID).Return(ownerWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, ownerWorkspace, nil)
 		mockUserService.EXPECT().GetUserByID(ctx, memberID).Return(nil, errors.New("user not found"))
 		mockLogger.EXPECT().WithField("user_id", memberID).Return(mockLogger)
 		mockLogger.EXPECT().WithField("error", "user not found").Return(mockLogger)
@@ -2726,8 +2744,7 @@ func TestWorkspaceService_RemoveMember(t *testing.T) {
 			Role:        "owner",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, ownerID, workspaceID).Return(ownerWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, ownerWorkspace, nil)
 		mockUserService.EXPECT().GetUserByID(ctx, memberID).Return(member, nil)
 		mockRepo.EXPECT().RemoveUserFromWorkspace(ctx, memberID, workspaceID).Return(errors.New("remove error"))
 		mockLogger.EXPECT().WithField("workspace_id", workspaceID).Return(mockLogger)
@@ -2749,8 +2766,7 @@ func TestWorkspaceService_RemoveMember(t *testing.T) {
 			Role:        "owner",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, ownerID, workspaceID).Return(ownerWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, ownerWorkspace, nil)
 		mockUserService.EXPECT().GetUserByID(ctx, apiKeyID).Return(apiKeyUser, nil)
 		mockRepo.EXPECT().RemoveUserFromWorkspace(ctx, apiKeyID, workspaceID).Return(nil)
 		mockUserRepo.EXPECT().Delete(ctx, apiKeyID).Return(errors.New("delete error"))
@@ -3559,8 +3575,7 @@ func TestWorkspaceService_SetUserPermissions(t *testing.T) {
 			Role:        "member",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, ownerID, workspaceID).Return(ownerWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, ownerWorkspace, nil)
 		mockRepo.EXPECT().GetUserWorkspace(ctx, targetUserID, workspaceID).Return(targetUserWorkspace, nil)
 		mockRepo.EXPECT().UpdateUserWorkspacePermissions(ctx, gomock.Any()).DoAndReturn(func(ctx context.Context, userWorkspace *domain.UserWorkspace) error {
 			assert.Equal(t, targetUserID, userWorkspace.UserID)
@@ -3594,8 +3609,7 @@ func TestWorkspaceService_SetUserPermissions(t *testing.T) {
 			Role:        "member",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, member, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, "member123", workspaceID).Return(memberWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, member, memberWorkspace, nil)
 
 		err := service.SetUserPermissions(ctx, workspaceID, targetUserID, permissions)
 		require.Error(t, err)
@@ -3610,8 +3624,7 @@ func TestWorkspaceService_SetUserPermissions(t *testing.T) {
 			Role:        "owner",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, ownerID, workspaceID).Return(ownerWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, ownerWorkspace, nil)
 		mockRepo.EXPECT().GetUserWorkspace(ctx, targetUserID, workspaceID).Return(nil, errors.New("user not found"))
 
 		err := service.SetUserPermissions(ctx, workspaceID, targetUserID, permissions)
@@ -3632,8 +3645,7 @@ func TestWorkspaceService_SetUserPermissions(t *testing.T) {
 			Role:        "owner",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, ownerID, workspaceID).Return(ownerWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, ownerWorkspace, nil)
 		mockRepo.EXPECT().GetUserWorkspace(ctx, targetUserID, workspaceID).Return(targetOwnerWorkspace, nil)
 
 		err := service.SetUserPermissions(ctx, workspaceID, targetUserID, permissions)
@@ -3654,8 +3666,7 @@ func TestWorkspaceService_SetUserPermissions(t *testing.T) {
 			Role:        "member",
 		}
 
-		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, nil, nil)
-		mockRepo.EXPECT().GetUserWorkspace(ctx, ownerID, workspaceID).Return(ownerWorkspace, nil)
+		mockAuthService.EXPECT().AuthenticateUserForWorkspace(ctx, workspaceID).Return(ctx, owner, ownerWorkspace, nil)
 		mockRepo.EXPECT().GetUserWorkspace(ctx, targetUserID, workspaceID).Return(targetUserWorkspace, nil)
 		mockRepo.EXPECT().UpdateUserWorkspacePermissions(ctx, gomock.Any()).Return(nil)
 		mockUserRepo.EXPECT().GetSessionsByUserID(ctx, targetUserID).Return(nil, errors.New("session error"))
@@ -3809,9 +3820,6 @@ func TestWorkspaceService_InviteMember_TeamMemberLimit(t *testing.T) {
 			GetByID(gomock.Any(), workspaceID).
 			Return(&domain.Workspace{ID: workspaceID}, nil)
 		mockRepo.EXPECT().
-			IsUserWorkspaceMember(gomock.Any(), inviterID, workspaceID).
-			Return(true, nil)
-		mockRepo.EXPECT().
 			CountWorkspaceMembersAndInvitations(gomock.Any(), workspaceID).
 			Return(3, nil)
 
@@ -3834,9 +3842,6 @@ func TestWorkspaceService_InviteMember_TeamMemberLimit(t *testing.T) {
 		mockRepo.EXPECT().
 			GetByID(gomock.Any(), workspaceID).
 			Return(&domain.Workspace{ID: workspaceID}, nil)
-		mockRepo.EXPECT().
-			IsUserWorkspaceMember(gomock.Any(), inviterID, workspaceID).
-			Return(true, nil)
 		mockRepo.EXPECT().
 			CountWorkspaceMembersAndInvitations(gomock.Any(), workspaceID).
 			Return(2, nil)
@@ -3871,9 +3876,6 @@ func TestWorkspaceService_InviteMember_TeamMemberLimit(t *testing.T) {
 		mockRepo.EXPECT().
 			GetByID(gomock.Any(), workspaceID).
 			Return(&domain.Workspace{ID: workspaceID}, nil)
-		mockRepo.EXPECT().
-			IsUserWorkspaceMember(gomock.Any(), inviterID, workspaceID).
-			Return(true, nil)
 
 		// CountWorkspaceMembersAndInvitations should NOT be called when MaxUsers=0
 		// (gomock will fail if it's called since no expectation is set)
@@ -4153,5 +4155,55 @@ func TestWorkspaceService_CreateWorkspace_WorkspaceLimit(t *testing.T) {
 
 		var limitErr *domain.ErrWorkspaceLimitReached
 		assert.False(t, errors.As(err, &limitErr), "error should NOT be a workspace limit error")
+	})
+}
+
+// TestWorkspaceService_DeleteInvitation_PlatformAdmin verifies the explicit root bypass
+// in DeleteInvitation: a platform admin with no membership row may delete invitations,
+// but the bypass only fires for the typed not-a-member error — real DB errors still deny.
+func TestWorkspaceService_DeleteInvitation_PlatformAdmin(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockRepo := mocks.NewMockWorkspaceRepository(ctrl)
+	mockLogger := pkgmocks.NewMockLogger(ctrl)
+	mockAuthSvc := mocks.NewMockAuthService(ctrl)
+	cfg := &config.Config{RootEmail: "root@example.com"}
+
+	service := NewWorkspaceService(
+		mockRepo, mocks.NewMockUserRepository(ctrl), mocks.NewMockTaskRepository(ctrl), mockLogger,
+		mocks.NewMockUserServiceInterface(ctrl), mockAuthSvc, pkgmocks.NewMockMailer(ctrl), cfg,
+		mocks.NewMockContactService(ctrl), mocks.NewMockListService(ctrl),
+		mocks.NewMockContactListService(ctrl), mocks.NewMockTemplateService(ctrl),
+		mocks.NewMockWebhookRegistrationService(ctrl), "secret_key",
+		&SupabaseService{}, &DNSVerificationService{}, &BlogService{},
+	)
+
+	ctx := context.Background()
+	workspaceID := "ws1"
+	invitationID := "inv1"
+	mockLogger.EXPECT().WithField(gomock.Any(), gomock.Any()).Return(mockLogger).AnyTimes()
+	mockLogger.EXPECT().Error(gomock.Any()).AnyTimes()
+	mockLogger.EXPECT().Info(gomock.Any()).AnyTimes()
+	invitation := &domain.WorkspaceInvitation{ID: invitationID, WorkspaceID: workspaceID, Email: "x@example.com", ExpiresAt: time.Now().Add(time.Hour)}
+
+	t.Run("root admin without a membership row may delete the invitation", func(t *testing.T) {
+		mockAuthSvc.EXPECT().AuthenticateUserFromContext(ctx).Return(&domain.User{ID: "root-id", Email: "root@example.com"}, nil)
+		mockRepo.EXPECT().GetInvitationByID(ctx, invitationID).Return(invitation, nil)
+		mockRepo.EXPECT().GetUserWorkspace(ctx, "root-id", workspaceID).Return(nil, domain.ErrUserNotInWorkspace)
+		mockRepo.EXPECT().DeleteInvitation(ctx, invitationID).Return(nil)
+
+		err := service.DeleteInvitation(ctx, invitationID)
+		require.NoError(t, err)
+	})
+
+	t.Run("root bypass does not swallow a real DB error", func(t *testing.T) {
+		mockAuthSvc.EXPECT().AuthenticateUserFromContext(ctx).Return(&domain.User{ID: "root-id", Email: "root@example.com"}, nil)
+		mockRepo.EXPECT().GetInvitationByID(ctx, invitationID).Return(invitation, nil)
+		mockRepo.EXPECT().GetUserWorkspace(ctx, "root-id", workspaceID).Return(nil, errors.New("db connection lost"))
+		// No DeleteInvitation call expected — a non-not-found error must NOT be bypassed.
+
+		err := service.DeleteInvitation(ctx, invitationID)
+		require.Error(t, err)
 	})
 }
