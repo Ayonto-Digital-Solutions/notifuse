@@ -10,6 +10,13 @@
 # Fork-Delta (bewusst minimal): pkg/mailer/translations.go
 # ("Notifuse" -> "Ayonto Pulse", System-Mail-Texte).
 #
+# .github/workflows/ wird NICHT gesynct: Das GITHUB_TOKEN kann keine
+# Workflow-Dateien schreiben (einen `workflows`-Scope gibt es fuer diesen
+# Token nicht — nur PATs/GitHub-Apps haben ihn), der Push wuerde komplett
+# rejected. Die von Upstream geerbten Workflows laufen im Fork ohnehin nie:
+# GitHub registriert geerbte Fork-Workflows nicht, aktiv ist allein dieser
+# Sync. Sie bleiben daher auf Fork-Stand eingefroren.
+#
 # Bei Merge-Konflikt schlaegt der Run fehl -> lokal aufloesen:
 #   git fetch upstream && git merge upstream/main && git push
 
@@ -34,13 +41,51 @@ jobs:
 
       - name: Upstream mergen
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/Notifuse/notifuse.git
           git fetch upstream main
-          if git merge upstream/main -m "Merge upstream/main"; then
-            git push origin ayonto-branding
-          else
-            echo "::error::Merge-Konflikt mit Upstream — lokal aufloesen: git fetch upstream && git merge upstream/main"
-            exit 1
+
+          BEFORE="$(git rev-parse HEAD)"
+
+          # --no-ff: erzwingt einen eigenen Merge-Commit, damit das spaetere
+          # --amend garantiert unseren Commit trifft und nie einen von Upstream.
+          if ! git merge --no-ff upstream/main -m "Merge upstream/main"; then
+            UNMERGED="$(git diff --name-only --diff-filter=U)"
+
+            # Weil der Fork die Workflows eingefroren haelt, sieht jede erneute
+            # Upstream-Aenderung an denselben Zeilen fuer git wie ein echter
+            # Konflikt aus. Solche Konflikte gehoeren automatisch auf Fork-Stand
+            # aufgeloest — nur alles ausserhalb ist ein Fall fuer einen Menschen.
+            OTHER="$(echo "$UNMERGED" | grep -v '^\.github/workflows/' || true)"
+            if [ -n "$OTHER" ]; then
+              echo "::error::Merge-Konflikt ausserhalb .github/workflows — lokal aufloesen: git fetch upstream && git merge upstream/main"
+              echo "$OTHER"
+              exit 1
+            fi
+
+            echo "$UNMERGED" | xargs git checkout --ours --
+            echo "$UNMERGED" | xargs git add --
+            git commit --no-edit
           fi
+
+          # Workflow-Verzeichnis exakt auf Fork-Stand zurueckdrehen (siehe Kopf).
+          # Der Merge-Commit behaelt upstream/main als Parent — die uebersprungene
+          # Aenderung gilt damit als gemergt und taucht beim naechsten Lauf nicht
+          # wieder auf. Ohne diesen Parent wuerde der Sync jeden Tag erneut brechen.
+          if ! git diff --quiet "$BEFORE" HEAD -- .github/workflows; then
+            rm -rf .github/workflows
+            git checkout "$BEFORE" -- .github/workflows
+            git add -A .github/workflows
+            git commit --amend --no-edit
+            echo "::notice::.github/workflows auf Fork-Stand gehalten (GITHUB_TOKEN hat keinen workflows-Scope)."
+          fi
+
+          if [ "$(git rev-parse HEAD)" = "$BEFORE" ]; then
+            echo "::notice::Bereits aktuell — nichts zu pushen."
+            exit 0
+          fi
+
+          git push origin ayonto-branding
