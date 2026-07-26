@@ -14,7 +14,7 @@ import (
 var AllowedContactFields = map[string]bool{
 	// Core fields
 	"external_id": true, "timezone": true, "language": true,
-	"first_name": true, "last_name": true, "phone": true, "photo_url": true,
+	"first_name": true, "last_name": true, "phone": true,
 	// Address fields
 	"address_line_1": true, "address_line_2": true,
 	"country": true, "postcode": true, "state": true,
@@ -109,6 +109,10 @@ func (g *AutomationTriggerGenerator) buildWHENClause(automation *domain.Automati
 		// Custom event with specific name filter
 		conditions = append(conditions, fmt.Sprintf("NEW.kind = 'custom_event.%s'", escapeString(*trigger.CustomEventName)))
 	} else {
+		// Every event kind (contact.*, list.*, segment.*, email.*) equals the
+		// contact_timeline.kind written by the DB triggers, so match verbatim.
+		// (email.sent / email.delivered are not valid automation kinds — see
+		// domain.ValidEventKinds — so a WHEN clause on them would never match a row.)
 		conditions = append(conditions, fmt.Sprintf("NEW.kind = '%s'", escapeString(trigger.EventKind)))
 	}
 
@@ -156,11 +160,6 @@ func (g *AutomationTriggerGenerator) buildWHENClause(automation *domain.Automati
 
 	// Combine with AND
 	return strings.Join(conditions, " AND "), nil
-}
-
-// buildEventKindFilter generates SQL for filtering by event kind
-func (g *AutomationTriggerGenerator) buildEventKindFilter(eventKind string) string {
-	return fmt.Sprintf("NEW.kind = '%s'", escapeString(eventKind))
 }
 
 // buildFunctionBody generates the function body SQL
