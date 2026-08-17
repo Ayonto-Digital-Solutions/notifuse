@@ -2,6 +2,7 @@ package domain
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -1732,4 +1733,268 @@ func TestABTestNodeConfig_Validate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTimelineTriggerConfig_Validate_Conditions drives the condition tree from raw JSON
+// rather than struct literals: the console sends JSON, and a struct literal cannot express
+// an absent field (a missing "kind", an empty "leaves" array) the way a client can.
+func TestTimelineTriggerConfig_Validate_Conditions(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "conditions omitted entirely",
+			body:    `{"event_kind":"contact.created","frequency":"once"}`,
+			wantErr: false,
+		},
+		{
+			name:    "conditions explicitly null",
+			body:    `{"event_kind":"contact.created","frequency":"once","conditions":null}`,
+			wantErr: false,
+		},
+		{
+			name: "valid contacts leaf",
+			body: `{"event_kind":"contact.created","frequency":"once","conditions":{
+				"kind":"leaf",
+				"leaf":{"source":"contacts","contact":{"filters":[
+					{"field_name":"country","field_type":"string","operator":"equals","string_values":["US"]}
+				]}}
+			}}`,
+			wantErr: false,
+		},
+		{
+			name: "valid branch of two leaves",
+			body: `{"event_kind":"contact.created","frequency":"once","conditions":{
+				"kind":"branch",
+				"branch":{"operator":"and","leaves":[
+					{"kind":"leaf","leaf":{"source":"contacts","contact":{"filters":[
+						{"field_name":"country","field_type":"string","operator":"equals","string_values":["US"]}
+					]}}},
+					{"kind":"leaf","leaf":{"source":"contact_lists","contact_list":{"operator":"in","list_id":"list123"}}}
+				]}
+			}}`,
+			wantErr: false,
+		},
+		{
+			name: "branch with zero leaves",
+			body: `{"event_kind":"contact.created","frequency":"once","conditions":{
+				"kind":"branch",
+				"branch":{"operator":"and","leaves":[]}
+			}}`,
+			wantErr: true,
+			errMsg:  "invalid trigger conditions: branch must have at least one leaf",
+		},
+		{
+			name: "branch with leaves key omitted",
+			body: `{"event_kind":"contact.created","frequency":"once","conditions":{
+				"kind":"branch",
+				"branch":{"operator":"and"}
+			}}`,
+			wantErr: true,
+			errMsg:  "invalid trigger conditions: branch must have at least one leaf",
+		},
+		{
+			name: "leaf with unsupported source",
+			body: `{"event_kind":"contact.created","frequency":"once","conditions":{
+				"kind":"leaf",
+				"leaf":{"source":"orders"}
+			}}`,
+			wantErr: true,
+			errMsg:  "invalid trigger conditions: invalid source: orders",
+		},
+		{
+			name: "leaf with source omitted",
+			body: `{"event_kind":"contact.created","frequency":"once","conditions":{
+				"kind":"leaf",
+				"leaf":{}
+			}}`,
+			wantErr: true,
+			errMsg:  "invalid trigger conditions: leaf must have 'source' field",
+		},
+		{
+			name: "tree node with empty kind",
+			body: `{"event_kind":"contact.created","frequency":"once","conditions":{
+				"kind":"",
+				"leaf":{"source":"contacts","contact":{"filters":[
+					{"field_name":"country","field_type":"string","operator":"equals","string_values":["US"]}
+				]}}
+			}}`,
+			wantErr: true,
+			errMsg:  "invalid trigger conditions: tree node must have 'kind' field",
+		},
+		{
+			name: "tree node with kind omitted",
+			body: `{"event_kind":"contact.created","frequency":"once","conditions":{
+				"leaf":{"source":"contacts","contact":{"filters":[
+					{"field_name":"country","field_type":"string","operator":"equals","string_values":["US"]}
+				]}}
+			}}`,
+			wantErr: true,
+			errMsg:  "invalid trigger conditions: tree node must have 'kind' field",
+		},
+		{
+			name: "nested branch leaf is validated too",
+			body: `{"event_kind":"contact.created","frequency":"once","conditions":{
+				"kind":"branch",
+				"branch":{"operator":"or","leaves":[
+					{"kind":"leaf","leaf":{"source":"contacts","contact":{"filters":[
+						{"field_name":"country","field_type":"string","operator":"equals","string_values":["US"]}
+					]}}},
+					{"kind":"leaf","leaf":{"source":"contacts","contact":{"filters":[
+						{"field_type":"string","operator":"equals","string_values":["US"]}
+					]}}}
+				]}
+			}}`,
+			wantErr: true,
+			errMsg:  "invalid trigger conditions: branch leaf 1: filter 0: filter must have 'field_name'",
+		},
+		{
+			name: "leaf declaring a source without its payload",
+			body: `{"event_kind":"contact.created","frequency":"once","conditions":{
+				"kind":"leaf",
+				"leaf":{"source":"contacts"}
+			}}`,
+			wantErr: true,
+			errMsg:  "invalid trigger conditions: leaf with source 'contacts' must have 'contact' field",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var cfg TimelineTriggerConfig
+			require.NoError(t, json.Unmarshal([]byte(tt.body), &cfg))
+
+			err := cfg.Validate()
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.errMsg)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestAutomation_Validate_TriggerConditions checks that a malformed condition tree fails the
+// whole automation: Automation.Validate is what the service calls before flipping to live.
+func TestAutomation_Validate_TriggerConditions(t *testing.T) {
+	const automationTemplate = `{
+		"id":"auto123",
+		"workspace_id":"ws123",
+		"name":"Welcome Series",
+		"status":"draft",
+		"list_id":"list123",
+		"root_node_id":"node123",
+		"trigger":{"event_kind":"contact.created","frequency":"once","conditions":%s}
+	}`
+
+	t.Run("valid conditions pass", func(t *testing.T) {
+		body := fmt.Sprintf(automationTemplate, `{
+			"kind":"leaf",
+			"leaf":{"source":"contacts","contact":{"filters":[
+				{"field_name":"country","field_type":"string","operator":"equals","string_values":["US"]}
+			]}}
+		}`)
+
+		var automation Automation
+		require.NoError(t, json.Unmarshal([]byte(body), &automation))
+		assert.NoError(t, automation.Validate())
+	})
+
+	t.Run("invalid conditions surface through Automation.Validate", func(t *testing.T) {
+		body := fmt.Sprintf(automationTemplate, `{"kind":"branch","branch":{"operator":"and","leaves":[]}}`)
+
+		var automation Automation
+		require.NoError(t, json.Unmarshal([]byte(body), &automation))
+
+		err := automation.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid trigger conditions")
+		assert.Contains(t, err.Error(), "branch must have at least one leaf")
+	})
+
+	t.Run("null conditions pass", func(t *testing.T) {
+		body := fmt.Sprintf(automationTemplate, `null`)
+
+		var automation Automation
+		require.NoError(t, json.Unmarshal([]byte(body), &automation))
+		assert.NoError(t, automation.Validate())
+	})
+}
+
+// Every node config type carries the optional canvas description through an embedded struct rather
+// than a repeated field. Embedding only does the right thing because encoding/json flattens an
+// anonymous field: were it nested under "NodeConfigDescription", the key the console actually writes
+// would be dropped silently, on every node type at once.
+func TestNodeConfigDescription_JSONRoundTrip(t *testing.T) {
+	const description = "Welcome - day 1"
+
+	delay := &DelayNodeConfig{}
+	email := &EmailNodeConfig{}
+	branch := &BranchNodeConfig{}
+	filter := &FilterNodeConfig{}
+	addToList := &AddToListNodeConfig{}
+	removeFromList := &RemoveFromListNodeConfig{}
+	listStatus := &ListStatusBranchNodeConfig{}
+	abTest := &ABTestNodeConfig{}
+	webhook := &WebhookNodeConfig{}
+
+	tests := []struct {
+		name string
+		into interface{}
+		body string
+		got  func() string
+		zero interface{}
+	}{
+		{"delay", delay, `{"description":%q,"duration":2,"unit":"days"}`, func() string { return delay.Description }, DelayNodeConfig{}},
+		{"email", email, `{"description":%q,"template_id":"tmpl123"}`, func() string { return email.Description }, EmailNodeConfig{}},
+		{"branch", branch, `{"description":%q,"paths":[],"default_path_id":"a"}`, func() string { return branch.Description }, BranchNodeConfig{}},
+		{"filter", filter, `{"description":%q,"conditions":null,"continue_node_id":"a","exit_node_id":"b"}`, func() string { return filter.Description }, FilterNodeConfig{}},
+		{"add_to_list", addToList, `{"description":%q,"list_id":"list123","status":"active"}`, func() string { return addToList.Description }, AddToListNodeConfig{}},
+		{"remove_from_list", removeFromList, `{"description":%q,"list_id":"list123"}`, func() string { return removeFromList.Description }, RemoveFromListNodeConfig{}},
+		{"list_status_branch", listStatus, `{"description":%q,"list_id":"list123"}`, func() string { return listStatus.Description }, ListStatusBranchNodeConfig{}},
+		{"ab_test", abTest, `{"description":%q,"variants":[]}`, func() string { return abTest.Description }, ABTestNodeConfig{}},
+		{"webhook", webhook, `{"description":%q,"url":"https://example.com"}`, func() string { return webhook.Description }, WebhookNodeConfig{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := fmt.Sprintf(tt.body, description)
+			require.NoError(t, json.Unmarshal([]byte(body), tt.into))
+			assert.Equal(t, description, tt.got())
+
+			// A node the author never described must not gain an empty key: the console omits it
+			// rather than sending "", and a stored config should round-trip unchanged.
+			encoded, err := json.Marshal(tt.zero)
+			require.NoError(t, err)
+			assert.NotContains(t, string(encoded), `"description"`)
+		})
+	}
+}
+
+// The filter node shipped with this key before every other node type had it, so its stored shape has
+// to keep decoding exactly as before - description alongside a real condition tree.
+func TestFilterNodeConfig_DescriptionWithConditions(t *testing.T) {
+	body := `{
+		"description": "Active users only",
+		"conditions": {"kind": "branch", "branch": {"operator": "and", "leaves": [
+			{"kind": "leaf", "leaf": {"table": "contacts", "filters": [
+				{"field_name": "email", "field_type": "string", "operator": "is_set"}
+			]}}
+		]}},
+		"continue_node_id": "node-yes",
+		"exit_node_id": "node-no"
+	}`
+
+	var config FilterNodeConfig
+	require.NoError(t, json.Unmarshal([]byte(body), &config))
+
+	assert.Equal(t, "Active users only", config.Description)
+	require.NotNil(t, config.Conditions)
+	assert.Equal(t, "branch", config.Conditions.Kind)
+	assert.Equal(t, "node-yes", config.ContinueNodeID)
+	assert.Equal(t, "node-no", config.ExitNodeID)
 }

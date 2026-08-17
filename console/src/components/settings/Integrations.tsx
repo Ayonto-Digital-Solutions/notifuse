@@ -215,7 +215,7 @@ const EmailIntegration = ({
         <Tooltip
           title={t`Forwards inbound replies to Notifuse so automations can stop when a contact replies (Exit on reply). Registering webhooks creates the provider-side route; you must also point your domain's MX records at your email provider.`}
         >
-          <Tag bordered={false} color={inboundRegistered ? 'green' : 'orange'}>
+          <Tag variant="filled" color={inboundRegistered ? 'green' : 'orange'}>
             {inboundRegistered ? (
               <FontAwesomeIcon icon={faCheck} className="text-green-500 mr-1" />
             ) : (
@@ -246,15 +246,15 @@ const EmailIntegration = ({
       return (
         <Descriptions.Item label={t`Webhooks`}>
           <div className="mb-2">
-            <Tag bordered={false} color="orange">
+            <Tag variant="filled" color="orange">
               <FontAwesomeIcon icon={faExclamationTriangle} className="text-yellow-500 mr-1" />
               {t`delivered`}
             </Tag>
-            <Tag bordered={false} color="orange">
+            <Tag variant="filled" color="orange">
               <FontAwesomeIcon icon={faExclamationTriangle} className="text-yellow-500 mr-1" />
               {t`bounce`}
             </Tag>
-            <Tag bordered={false} color="orange">
+            <Tag variant="filled" color="orange">
               <FontAwesomeIcon icon={faExclamationTriangle} className="text-yellow-500 mr-1" />
               {t`complaint`}
             </Tag>
@@ -283,7 +283,7 @@ const EmailIntegration = ({
               {webhookStatus.endpoints.map((endpoint, index) => (
                 <span key={index}>
                   <Tooltip title={endpoint.webhook_id + ' - ' + endpoint.url}>
-                    <Tag bordered={false} color={endpoint.active ? 'green' : 'orange'}>
+                    <Tag variant="filled" color={endpoint.active ? 'green' : 'orange'}>
                       {endpoint.active ? (
                         <FontAwesomeIcon icon={faCheck} className="text-green-500 mr-1" />
                       ) : (
@@ -323,7 +323,7 @@ const EmailIntegration = ({
             )}
           </div>
           {webhookStatus.error && (
-            <Alert message={webhookStatus.error} type="error" showIcon className="mt-2" />
+            <Alert title={webhookStatus.error} type="error" showIcon className="mt-2" />
           )}
         </div>
       </Descriptions.Item>
@@ -382,7 +382,7 @@ const EmailIntegration = ({
                 <div key={sender.id || index} className="mb-1">
                   {sender.name} &lt;{sender.email}&gt;
                   {sender.is_default && (
-                    <Tag bordered={false} color="blue" className="!ml-2">
+                    <Tag variant="filled" color="blue" className="!ml-2">
                       {t`Default`}
                     </Tag>
                   )}
@@ -398,23 +398,23 @@ const EmailIntegration = ({
             {isIntegrationInUse(integration.id) ? (
               <>
                 {purposes.includes('Marketing Emails') && (
-                  <Tag bordered={false} color="blue">
+                  <Tag variant="filled" color="blue">
                     <FontAwesomeIcon icon={faPaperPlane} className="mr-1" /> {t`Marketing Emails`}
                   </Tag>
                 )}
                 {purposes.includes('Transactional Emails') && (
-                  <Tag bordered={false} color="purple">
+                  <Tag variant="filled" color="purple">
                     <FontAwesomeIcon icon={faTerminal} className="mr-1" /> {t`Transactional Emails`}
                   </Tag>
                 )}
                 {purposes.length === 0 && (
-                  <Tag bordered={false} color="red">
+                  <Tag variant="filled" color="red">
                     {t`Not assigned`}
                   </Tag>
                 )}
               </>
             ) : (
-              <Tag bordered={false} color="red">
+              <Tag variant="filled" color="red">
                 {t`Not assigned`}
               </Tag>
             )}
@@ -612,6 +612,16 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
     return workspace.integrations?.find((i) => i.id === id)
   }
 
+  // Placeholder for a credential field. The server returns only the last few
+  // characters of a configured credential, never the credential itself, so an
+  // owner can tell which key is in place. Leaving the field blank on save keeps
+  // the stored one — the server preserves it.
+  const secretPlaceholder = (hintKey: string, fallback: string): string => {
+    if (!editingIntegrationId) return fallback
+    const hint = getIntegrationById(editingIntegrationId)?.credential_hints?.[hintKey]
+    return hint ? `••••••••${hint}` : t`Leave blank to keep the current value`
+  }
+
   // Is the integration being used
   const isIntegrationInUse = (id: string): boolean => {
     return (
@@ -790,6 +800,10 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
       name: provider.charAt(0).toUpperCase() + provider.slice(1),
       senders: []
     })
+    // Creation, not an edit. Nothing else clears this, and both the required
+    // rules and the credential placeholders key off it — leaving a previous
+    // edit's id here would make a new integration's credentials optional.
+    setEditingIntegrationId(null)
     setProviderDrawerVisible(true)
   }
 
@@ -950,6 +964,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
   const closeProviderDrawer = () => {
     setProviderDrawerVisible(false)
     setSelectedProviderType(null)
+    setEditingIntegrationId(null)
     setSenders([])
     emailProviderForm.resetFields()
   }
@@ -1132,7 +1147,8 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
       const response = await emailService.testProvider(
         workspace.id,
         providerToTest,
-        testEmailAddress
+        testEmailAddress,
+        testingIntegrationId ?? undefined
       )
 
       if (response.success) {
@@ -1280,8 +1296,14 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
           }
 
           if (integration.type === 'supabase') {
-            const hasAuthEmailHook = !!integration.supabase_settings?.auth_email_hook?.signature_key
+            // The encrypted form, not the plaintext: credentials are no longer
+            // served to clients, so keying off signature_key would show every
+            // configured hook as unconfigured.
+            const hasAuthEmailHook =
+              !!integration.supabase_settings?.auth_email_hook?.encrypted_signature_key ||
+              !!integration.supabase_settings?.auth_email_hook?.signature_key
             const hasBeforeUserCreatedHook =
+              !!integration.supabase_settings?.before_user_created_hook?.encrypted_signature_key ||
               !!integration.supabase_settings?.before_user_created_hook?.signature_key
             const addToLists =
               integration.supabase_settings?.before_user_created_hook?.add_user_to_lists || []
@@ -1345,8 +1367,8 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
                     <Descriptions.Item label={t`Name`}>{integration.name}</Descriptions.Item>
                     <Descriptions.Item label={t`Auth Email Hook`}>
                       {hasAuthEmailHook ? (
-                        <Space direction="vertical">
-                          <Tag bordered={false} color="green" className="mb-2">
+                        <Space orientation="vertical">
+                          <Tag variant="filled" color="green" className="mb-2">
                             <FontAwesomeIcon icon={faCheck} className="mr-1" /> {t`Configured`}
                           </Tag>
                           <div className="mt-2 text-xs text-gray-500">{t`Webhook endpoint:`}</div>
@@ -1375,15 +1397,15 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
                           />
                         </Space>
                       ) : (
-                        <Tag bordered={false} color="default">
+                        <Tag variant="filled" color="default">
                           {t`Not configured`}
                         </Tag>
                       )}
                     </Descriptions.Item>
                     <Descriptions.Item label={t`Before User Created Hook`}>
                       {hasBeforeUserCreatedHook ? (
-                        <Space direction="vertical">
-                          <Tag bordered={false} color="green" className="mb-2">
+                        <Space orientation="vertical">
+                          <Tag variant="filled" color="green" className="mb-2">
                             <FontAwesomeIcon icon={faCheck} className="mr-1" /> {t`Configured`}
                           </Tag>
                           <div className="mt-2 text-xs text-gray-500">{t`Webhook endpoint:`}</div>
@@ -1412,7 +1434,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
                           />
                         </Space>
                       ) : (
-                        <Tag bordered={false} color="default">
+                        <Tag variant="filled" color="default">
                           {t`Not configured`}
                         </Tag>
                       )}
@@ -1422,7 +1444,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
                         {addToLists.map((listId) => {
                           const list = lists.find((l) => l.id === listId)
                           return (
-                            <Tag key={listId} bordered={false} color="blue" className="mb-1">
+                            <Tag key={listId} variant="filled" color="blue" className="mb-1">
                               {list?.name || listId}
                             </Tag>
                           )
@@ -1431,7 +1453,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
                     )}
                     {hasBeforeUserCreatedHook && customJsonField && (
                       <Descriptions.Item label={t`User Metadata Field`}>
-                        <Tag bordered={false} color="purple">
+                        <Tag variant="filled" color="purple">
                           {workspace.settings?.custom_field_labels?.[customJsonField] ||
                             customJsonField}
                         </Tag>
@@ -1439,7 +1461,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
                     )}
                     {hasBeforeUserCreatedHook && (
                       <Descriptions.Item label={t`Reject Disposable Email`}>
-                        <Tag bordered={false} color={rejectDisposableEmail ? 'green' : 'default'}>
+                        <Tag variant="filled" color={rejectDisposableEmail ? 'green' : 'default'}>
                           {rejectDisposableEmail ? (
                             <>
                               <FontAwesomeIcon icon={faCheck} className="mr-1" /> {t`Enabled`}
@@ -1503,7 +1525,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
                   <Descriptions bordered size="small" column={1} className="mt-2">
                     <Descriptions.Item label={t`Name`}>{integration.name}</Descriptions.Item>
                     <Descriptions.Item label={t`Model`}>
-                      <Tag bordered={false} color="purple">
+                      <Tag variant="filled" color="purple">
                         {provider.kind === 'openai'
                           ? provider.openai?.model || 'Not configured'
                           : provider.kind === 'gemini'
@@ -1513,13 +1535,13 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
                     </Descriptions.Item>
                     {provider.kind === 'openai' && provider.openai?.base_url && (
                       <Descriptions.Item label={t`Base URL`}>
-                        <Tag bordered={false} color="blue">
+                        <Tag variant="filled" color="blue">
                           {provider.openai.base_url}
                         </Tag>
                       </Descriptions.Item>
                     )}
                     <Descriptions.Item label={t`API Key`}>
-                      <Tag bordered={false} color="green">
+                      <Tag variant="filled" color="green">
                         <FontAwesomeIcon icon={faCheck} className="mr-1" /> {t`Configured`}
                       </Tag>
                     </Descriptions.Item>
@@ -1570,16 +1592,16 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
                   <Descriptions bordered size="small" column={1} className="mt-2">
                     <Descriptions.Item label={t`Name`}>{integration.name}</Descriptions.Item>
                     <Descriptions.Item label={t`API Key`}>
-                      <Tag bordered={false} color="green">
+                      <Tag variant="filled" color="green">
                         <FontAwesomeIcon icon={faCheck} className="mr-1" /> {t`Configured`}
                       </Tag>
                     </Descriptions.Item>
                     <Descriptions.Item label={t`Tools`}>
                       <Space>
-                        <Tag bordered={false} color="blue">
+                        <Tag variant="filled" color="blue">
                           scrape_url
                         </Tag>
-                        <Tag bordered={false} color="blue">
+                        <Tag variant="filled" color="blue">
                           search_web
                         </Tag>
                       </Space>
@@ -1676,7 +1698,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
               <Input placeholder={t`Access Key`} disabled={!isOwner} />
             </Form.Item>
             <Form.Item name={['ses', 'secret_key']} label={t`AWS Secret Key`}>
-              <Input.Password placeholder={t`Secret Key`} disabled={!isOwner} />
+              <Input.Password placeholder={secretPlaceholder('ses.secret_key', t`Secret Key`)} disabled={!isOwner} />
             </Form.Item>
           </>
         )}
@@ -1800,11 +1822,19 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
                                 <Form.Item
                                   name={['smtp', 'oauth2_client_secret']}
                                   label="Client Secret"
-                                  rules={[{ required: true, message: 'Client Secret is required' }]}
+                                  rules={[
+                                    {
+                                      required: !editingIntegrationId,
+                                      message: 'Client Secret is required'
+                                    }
+                                  ]}
                                   tooltip={t`Create this in Azure Portal > App registrations > Your App > Certificates & secrets`}
                                 >
                                   <Input.Password
-                                    placeholder="Client Secret Value"
+                                    placeholder={secretPlaceholder(
+                                      'smtp.oauth2_client_secret',
+                                      t`Client Secret Value`
+                                    )}
                                     disabled={!isOwner}
                                   />
                                 </Form.Item>
@@ -1826,17 +1856,28 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
                                 <Form.Item
                                   name={['smtp', 'oauth2_client_secret']}
                                   label="Client Secret"
-                                  rules={[{ required: true, message: 'Client Secret is required' }]}
+                                  rules={[
+                                    {
+                                      required: !editingIntegrationId,
+                                      message: 'Client Secret is required'
+                                    }
+                                  ]}
                                   tooltip={t`Find this in Google Cloud Console > APIs & Services > Credentials`}
                                 >
-                                  <Input.Password placeholder="Client Secret" disabled={!isOwner} />
+                                  <Input.Password
+                                    placeholder={secretPlaceholder(
+                                      'smtp.oauth2_client_secret',
+                                      t`Client Secret`
+                                    )}
+                                    disabled={!isOwner}
+                                  />
                                 </Form.Item>
                                 <Form.Item
                                   name={['smtp', 'oauth2_refresh_token']}
                                   label="Refresh Token"
                                   rules={[
                                     {
-                                      required: true,
+                                      required: !editingIntegrationId,
                                       message: 'Refresh Token is required for Google'
                                     }
                                   ]}
@@ -1865,7 +1906,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
                     </Col>
                     <Col span={12}>
                       <Form.Item name={['smtp', 'password']} label={t`SMTP Password`}>
-                        <Input.Password placeholder="Password (optional)" disabled={!isOwner} />
+                        <Input.Password placeholder={secretPlaceholder('smtp.password', t`Password (optional)`)} disabled={!isOwner} />
                       </Form.Item>
                     </Col>
                   </Row>
@@ -1899,7 +1940,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
               />
             </Form.Item>
             <Form.Item name={['sparkpost', 'api_key']} label={t`SparkPost API Key`}>
-              <Input.Password placeholder="API Key" disabled={!isOwner} />
+              <Input.Password placeholder={secretPlaceholder('sparkpost.api_key', t`API Key`)} disabled={!isOwner} />
             </Form.Item>
             <Form.Item
               name={['sparkpost', 'sandbox_mode']}
@@ -1917,9 +1958,9 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
             <Form.Item
               name={['postmark', 'server_token']}
               label={t`Server Token`}
-              rules={[{ required: true }]}
+              rules={[{ required: !editingIntegrationId }]}
             >
-              <Input.Password placeholder="Server Token" disabled={!isOwner} />
+              <Input.Password placeholder={secretPlaceholder('postmark.server_token', t`Server Token`)} disabled={!isOwner} />
             </Form.Item>
             <Form.Item
               name={['postmark', 'message_stream']}
@@ -1937,8 +1978,8 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
             <Form.Item name={['mailgun', 'domain']} label={t`Domain`} rules={[{ required: true }]}>
               <Input placeholder="mail.yourdomain.com" disabled={!isOwner} />
             </Form.Item>
-            <Form.Item name={['mailgun', 'api_key']} label={t`API Key`} rules={[{ required: true }]}>
-              <Input.Password placeholder="API Key" disabled={!isOwner} />
+            <Form.Item name={['mailgun', 'api_key']} label={t`API Key`} rules={[{ required: !editingIntegrationId }]}>
+              <Input.Password placeholder={secretPlaceholder('mailgun.api_key', t`API Key`)} disabled={!isOwner} />
             </Form.Item>
             <Form.Item name={['mailgun', 'region']} label={t`Region`} initialValue="US">
               <Select
@@ -1955,15 +1996,15 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
 
         {providerType === 'mailjet' && (
           <>
-            <Form.Item name={['mailjet', 'api_key']} label={t`API Key`} rules={[{ required: true }]}>
-              <Input.Password placeholder="API Key" disabled={!isOwner} />
+            <Form.Item name={['mailjet', 'api_key']} label={t`API Key`} rules={[{ required: !editingIntegrationId }]}>
+              <Input.Password placeholder={secretPlaceholder('mailjet.api_key', t`API Key`)} disabled={!isOwner} />
             </Form.Item>
             <Form.Item
               name={['mailjet', 'secret_key']}
               label={t`Secret Key`}
-              rules={[{ required: true }]}
+              rules={[{ required: !editingIntegrationId }]}
             >
-              <Input.Password placeholder="Secret Key" disabled={!isOwner} />
+              <Input.Password placeholder={secretPlaceholder('mailjet.secret_key', t`Secret Key`)} disabled={!isOwner} />
             </Form.Item>
             <Form.Item
               name={['mailjet', 'sandbox_mode']}
@@ -1977,8 +2018,8 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
         )}
 
         {providerType === 'sendgrid' && (
-          <Form.Item name={['sendgrid', 'api_key']} label={t`API Key`} rules={[{ required: true }]}>
-            <Input.Password placeholder="API Key (starts with SG.)" disabled={!isOwner} />
+          <Form.Item name={['sendgrid', 'api_key']} label={t`API Key`} rules={[{ required: !editingIntegrationId }]}>
+            <Input.Password placeholder={secretPlaceholder('sendgrid.api_key', t`API Key (starts with SG.)`)} disabled={!isOwner} />
           </Form.Item>
         )}
 
@@ -2108,7 +2149,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
           <span>
             {text}
             {record.is_default && (
-              <Tag bordered={false} color="blue" className="!ml-2">
+              <Tag variant="filled" color="blue" className="!ml-2">
                 Default
               </Tag>
             )}
@@ -2236,12 +2277,12 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
           {configurationSet ? (
             <>
               <span className="font-mono text-xs">{configurationSet}</span>
-              <Tag bordered={false} color={ses.configuration_set_name ? 'purple' : 'blue'} className="!ml-2">
+              <Tag variant="filled" color={ses.configuration_set_name ? 'purple' : 'blue'} className="!ml-2">
                 {ses.configuration_set_name ? t`custom` : t`managed`}
               </Tag>
             </>
           ) : (
-            <Tag bordered={false} color="orange">
+            <Tag variant="filled" color="orange">
               <FontAwesomeIcon icon={faExclamationTriangle} className="text-yellow-500 mr-1" />
               {t`not created yet — register webhooks`}
             </Tag>
@@ -2250,14 +2291,14 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
         <Descriptions.Item key="reputation" label={t`Reputation`}>
           {tenant ? (
             <>
-              <Tag bordered={false} color="green">
+              <Tag variant="filled" color="green">
                 {t`isolated`}
               </Tag>
               <span className="font-mono text-xs">{tenant}</span>
             </>
           ) : ses.tenant_isolation_enabled ? (
             // Intent recorded but nothing provisioned: the state that must never look fine.
-            <Tag bordered={false} color="orange">
+            <Tag variant="filled" color="orange">
               <FontAwesomeIcon icon={faExclamationTriangle} className="text-yellow-500 mr-1" />
               {t`isolation requested but not provisioned`}
             </Tag>
@@ -2343,7 +2384,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
             ? `Edit ${selectedProviderType?.toUpperCase() || ''} Integration`
             : `Add New ${selectedProviderType?.toUpperCase() || ''} Integration`
         }
-        width={600}
+        size={600}
         open={providerDrawerVisible}
         onClose={closeProviderDrawer}
         footer={
@@ -2435,7 +2476,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
           {(!workspace.settings.transactional_email_provider_id ||
             !workspace.settings.marketing_email_provider_id) && (
             <Alert
-              message={t`Email Provider Configuration Needed`}
+              title={t`Email Provider Configuration Needed`}
               description={
                 <div>
                   {!workspace.settings.transactional_email_provider_id && (
@@ -2528,7 +2569,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
           style={{ marginBottom: 16 }}
         />
         <Alert
-          message={t`This will send a real test email to the address provided.`}
+          title={t`This will send a real test email to the address provided.`}
           type="info"
           showIcon
         />
@@ -2539,7 +2580,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
         title={
           editingSupabaseIntegration ? 'Edit SUPABASE Integration' : 'Add New SUPABASE Integration'
         }
-        width={600}
+        size={600}
         open={supabaseDrawerVisible}
         onClose={() => {
           setSupabaseDrawerVisible(false)
@@ -2567,7 +2608,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
             </Space>
           </div>
         }
-        destroyOnClose
+        destroyOnHidden
       >
         <SupabaseIntegration
           integration={editingSupabaseIntegration || undefined}
@@ -2585,7 +2626,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
             ? `Edit ${getLLMProviderName(selectedLLMProvider || 'anthropic').toUpperCase()} Integration`
             : `Add New ${getLLMProviderName(selectedLLMProvider || 'anthropic').toUpperCase()} Integration`
         }
-        width={600}
+        size={600}
         open={llmDrawerVisible}
         onClose={() => {
           setLLMDrawerVisible(false)
@@ -2615,7 +2656,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
             </Space>
           </div>
         }
-        destroyOnClose
+        destroyOnHidden
       >
         {selectedLLMProvider && (
           <LLMIntegration
@@ -2634,7 +2675,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
         title={
           editingFirecrawlIntegration ? 'Edit Firecrawl Integration' : 'Add Firecrawl Integration'
         }
-        width={600}
+        size={600}
         open={firecrawlDrawerVisible}
         onClose={() => {
           setFirecrawlDrawerVisible(false)
@@ -2662,7 +2703,7 @@ export function Integrations({ workspace, onSave, loading, isOwner }: Integratio
             </Space>
           </div>
         }
-        destroyOnClose
+        destroyOnHidden
       >
         <FirecrawlIntegration
           integration={editingFirecrawlIntegration || undefined}

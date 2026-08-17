@@ -6,22 +6,9 @@ import (
 	"regexp"
 
 	"github.com/Notifuse/notifuse/pkg/crypto"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/service/sns"
 )
 
 //go:generate mockgen -destination mocks/mock_ses_service.go -package mocks github.com/Notifuse/notifuse/internal/domain SESServiceInterface
-//go:generate mockgen -destination mocks/mock_sns_client.go -package mocks github.com/Notifuse/notifuse/internal/domain SNSClient
-
-
-// SNSWebhookClient defines the interface for SNS client operations related to webhook management
-type SNSClient interface {
-	CreateTopicWithContext(ctx context.Context, input *sns.CreateTopicInput, opts ...request.Option) (*sns.CreateTopicOutput, error)
-	DeleteTopicWithContext(ctx context.Context, input *sns.DeleteTopicInput, opts ...request.Option) (*sns.DeleteTopicOutput, error)
-	SubscribeWithContext(ctx context.Context, input *sns.SubscribeInput, opts ...request.Option) (*sns.SubscribeOutput, error)
-	GetTopicAttributesWithContext(ctx context.Context, input *sns.GetTopicAttributesInput, opts ...request.Option) (*sns.GetTopicAttributesOutput, error)
-}
-
 // SESWebhookPayload represents an Amazon SES webhook payload
 type SESWebhookPayload struct {
 	Type              string                         `json:"Type"`
@@ -194,6 +181,10 @@ type AmazonSESSettings struct {
 	// TenantName scopes sends to a tenant the operator manages themselves. Mutually exclusive
 	// with TenantIsolationEnabled: two sources of truth for the same value is not a state worth
 	// having.
+	//
+	// It is a typed field rather than a generic custom-header bag for a hard reason, not a
+	// stylistic one: AWS honours the X-SES-TENANT header over SMTP only and never on the v2
+	// API, which is the path used here. A header mechanism could not carry a tenant at all.
 	TenantName string `json:"tenant_name,omitempty"`
 
 	// --- derived state, written by provisioning; never form fields -------------------------

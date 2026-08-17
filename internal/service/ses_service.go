@@ -1033,6 +1033,12 @@ func (s *SESService) EnsureInboundRoute(ctx context.Context, providerConfig *dom
 	}); err != nil && !isAWSErrCode(err, ses.ErrCodeAlreadyExistsException) {
 		return fmt.Errorf("failed to create inbound receipt rule: %w", err)
 	}
+	// Activation is reached ONLY on the path where no rule set was active. An AWS
+	// account has exactly one active receipt rule set per region, so activating ours
+	// unconditionally would deactivate whatever else the customer receives mail with
+	// — WorkMail, another product, their own rules — instantly and silently, from our
+	// side of the account. When a set is already active we add our rule into it
+	// instead. Do not lift this call out of that branch.
 	if _, err := sesClient.SetActiveReceiptRuleSetWithContext(ctx, &ses.SetActiveReceiptRuleSetInput{
 		RuleSetName: aws.String(sesInboundRuleSetName),
 	}); err != nil {
@@ -1217,17 +1223,22 @@ func (s *SESService) resolveConfigurationSet(ctx context.Context, cfg domain.Ama
 	}
 
 	key := integrationID + "|" + cfg.Region
-	if v, ok := s.configSetCache.Load(key); ok {
-		entry := v.(configSetCacheEntry)
-		if entry.expiresAt.IsZero() || time.Now().Before(entry.expiresAt) {
-			return entry.name
-		}
+	if name, ok := s.cachedConfigurationSet(key); ok {
+		return name
 	}
 
 	// singleflight collapses the cold-start stampede: the queue runs several workers per
 	// workspace and processes workspaces concurrently, so without it a restart would fire
 	// hundreds of concurrent calls at a once-per-second API.
 	v, _, _ := s.configSetGroup.Do(key, func() (interface{}, error) {
+		// Re-read the cache now that this goroutine owns the flight. A sender that missed the
+		// cache just before the previous flight stored its answer arrives here once that flight
+		// has already released the key, and would otherwise start a second lookup at an API AWS
+		// throttles to one call per second.
+		if name, ok := s.cachedConfigurationSet(key); ok {
+			return name, nil
+		}
+
 		want := fmt.Sprintf("notifuse-%s", integrationID)
 
 		sets, err := s.ListConfigurationSets(ctx, cfg)
@@ -1253,6 +1264,20 @@ func (s *SESService) resolveConfigurationSet(ctx context.Context, cfg domain.Ama
 
 	name, _ := v.(string)
 	return name
+}
+
+// cachedConfigurationSet returns the memoised answer for a key, and whether it is still usable.
+// A negative answer is only trusted until it expires; a positive one never does.
+func (s *SESService) cachedConfigurationSet(key string) (string, bool) {
+	v, ok := s.configSetCache.Load(key)
+	if !ok {
+		return "", false
+	}
+	entry := v.(configSetCacheEntry)
+	if entry.expiresAt.IsZero() || time.Now().Before(entry.expiresAt) {
+		return entry.name, true
+	}
+	return "", false
 }
 
 // invalidateConfigurationSetCache drops the memoised answer for an integration, so a teardown or

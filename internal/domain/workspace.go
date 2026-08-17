@@ -29,6 +29,7 @@ const (
 	PermissionResourceBlog           PermissionResource = "blog"
 	PermissionResourceAutomations    PermissionResource = "automations"
 	PermissionResourceLLM            PermissionResource = "llm"
+	PermissionResourceWebAnalytics   PermissionResource = "web_analytics"
 )
 
 // PermissionType defines the types of permissions (read/write)
@@ -50,6 +51,7 @@ var FullPermissions = UserPermissions{
 	PermissionResourceBlog:           ResourcePermissions{Read: true, Write: true},
 	PermissionResourceAutomations:    ResourcePermissions{Read: true, Write: true},
 	PermissionResourceLLM:            ResourcePermissions{Read: true, Write: true},
+	PermissionResourceWebAnalytics:   ResourcePermissions{Read: true, Write: true},
 }
 
 // ResourcePermissions defines read/write permissions for a specific resource
@@ -134,8 +136,12 @@ type Integration struct {
 	SupabaseSettings  *SupabaseIntegrationSettings `json:"supabase_settings,omitempty"`
 	LLMProvider       *LLMProvider                 `json:"llm_provider,omitempty"`
 	FirecrawlSettings *FirecrawlSettings           `json:"firecrawl_settings,omitempty"`
-	CreatedAt         time.Time                    `json:"created_at"`
-	UpdatedAt         time.Time                    `json:"updated_at"`
+	// CredentialHints maps a credential to its last few characters, so an owner
+	// can tell which key is configured without the key being served. Computed by
+	// Redact at the API boundary and cleared by BeforeSave — never stored.
+	CredentialHints map[string]string `json:"credential_hints,omitempty"`
+	CreatedAt       time.Time         `json:"created_at"`
+	UpdatedAt       time.Time         `json:"updated_at"`
 }
 
 // Validate validates the integration
@@ -192,6 +198,11 @@ func (i *Integration) Validate(passphrase string) error {
 
 // BeforeSave prepares an Integration for saving by encrypting secrets
 func (i *Integration) BeforeSave(secretkey string) error {
+	// Display-only, recomputed on every read. Persisting it would leave a stale
+	// hint behind after a rotation, and put a fragment of the secret in a column
+	// that is not meant to hold one.
+	i.CredentialHints = nil
+
 	// Encrypt based on integration type
 	switch i.Type {
 	case IntegrationTypeEmail:
@@ -362,13 +373,20 @@ type WorkspaceSettings struct {
 	MarketingEmailProviderID     string              `json:"marketing_email_provider_id,omitempty"`
 	EncryptedSecretKey           string              `json:"encrypted_secret_key,omitempty"`
 	EmailTrackingEnabled         bool                `json:"email_tracking_enabled"`
-	TemplateBlocks               []TemplateBlock     `json:"template_blocks,omitempty"`
-	CustomEndpointURL            *string             `json:"custom_endpoint_url,omitempty"`
-	CustomFieldLabels            map[string]string   `json:"custom_field_labels,omitempty"`
-	BlogEnabled                  bool                `json:"blog_enabled"`            // Enable blog feature at workspace level
-	BlogSettings                 *BlogSettings       `json:"blog_settings,omitempty"` // Blog styling and SEO settings
-	DefaultLanguage              string              `json:"default_language"`
-	Languages                    []string            `json:"languages"`
+	// TemplateBlocks live inside this settings blob rather than in their own table,
+	// which is why block CRUD emits no webhook events while template CRUD does:
+	// every webhook event in the product is produced by a row trigger writing to
+	// webhook_deliveries, and there are no block rows to trigger on. Adding them
+	// would mean inserting deliveries from the service layer — a second, parallel
+	// mechanism — so it is a deliberate initiative, not an oversight to patch.
+	TemplateBlocks    []TemplateBlock       `json:"template_blocks,omitempty"`
+	CustomEndpointURL *string               `json:"custom_endpoint_url,omitempty"`
+	CustomFieldLabels map[string]string     `json:"custom_field_labels,omitempty"`
+	BlogEnabled       bool                  `json:"blog_enabled"`            // Enable blog feature at workspace level
+	BlogSettings      *BlogSettings         `json:"blog_settings,omitempty"` // Blog styling and SEO settings
+	WebAnalytics      *WebAnalyticsSettings `json:"web_analytics,omitempty"` // Web analytics configuration
+	DefaultLanguage   string                `json:"default_language"`
+	Languages         []string              `json:"languages"`
 
 	// decoded secret key, not stored in the database
 	SecretKey string `json:"-"`
@@ -465,6 +483,10 @@ func (ws *WorkspaceSettings) Validate(passphrase string) error {
 	}
 	if !found {
 		return fmt.Errorf("default language %s must be in the languages list", ws.DefaultLanguage)
+	}
+
+	if err := ws.WebAnalytics.Validate(); err != nil {
+		return fmt.Errorf("invalid web analytics settings: %w", err)
 	}
 
 	return nil
@@ -1062,6 +1084,10 @@ type WorkspaceServiceInterface interface {
 
 	// Blog management
 	SetBlogSettings(ctx context.Context, workspaceID string, enabled bool, settings *BlogSettings) error
+
+	// SetWebAnalyticsSettings replaces the workspace's web analytics settings
+	// (gated by web_analytics:write; recomputes the filters version).
+	SetWebAnalyticsSettings(ctx context.Context, workspaceID string, settings *WebAnalyticsSettings) error
 }
 
 // Request/Response types
@@ -1357,6 +1383,32 @@ func (r *SetBlogSettingsRequest) Validate() (workspaceID string, enabled bool, s
 	return r.WorkspaceID, r.BlogEnabled, r.BlogSettings, nil
 }
 
+// SetWebAnalyticsSettingsRequest defines the request structure for replacing a
+// workspace's web analytics settings via the dedicated, web_analytics:write
+// gated endpoint.
+type SetWebAnalyticsSettingsRequest struct {
+	WorkspaceID string                `json:"workspace_id"`
+	Settings    *WebAnalyticsSettings `json:"settings"`
+}
+
+// Validate validates the request and returns the workspace ID and the
+// (possibly nil) settings. Nil settings clear the stored configuration.
+func (r *SetWebAnalyticsSettingsRequest) Validate() (workspaceID string, settings *WebAnalyticsSettings, err error) {
+	if r.WorkspaceID == "" {
+		return "", nil, fmt.Errorf("invalid set web analytics settings request: workspace_id is required")
+	}
+	if !govalidator.IsAlphanumeric(r.WorkspaceID) {
+		return "", nil, fmt.Errorf("invalid set web analytics settings request: workspace_id must be alphanumeric")
+	}
+	if len(r.WorkspaceID) > 32 {
+		return "", nil, fmt.Errorf("invalid set web analytics settings request: workspace_id length must be between 1 and 32")
+	}
+	if err := r.Settings.ValidateForSave(); err != nil {
+		return "", nil, err
+	}
+	return r.WorkspaceID, r.Settings, nil
+}
+
 type InviteMemberRequest struct {
 	WorkspaceID string          `json:"workspace_id"`
 	Email       string          `json:"email"`
@@ -1414,9 +1466,15 @@ func (r *InviteMemberRequest) Validate() error {
 // TestEmailProviderRequest is the request for testing an email provider
 // It includes the provider config, a recipient email, and the workspace ID
 type TestEmailProviderRequest struct {
-	Provider    EmailProvider `json:"provider"`
-	To          string        `json:"to"`
-	WorkspaceID string        `json:"workspace_id"`
+	Provider EmailProvider `json:"provider"`
+	To       string        `json:"to"`
+	// IntegrationID names the saved integration being tested, when there is one.
+	// Credentials are not served to clients, so a client testing a saved
+	// integration cannot send them back; blank ones are filled from this
+	// integration. Absent when testing a provider not yet saved, where the client
+	// still holds what it typed.
+	IntegrationID string `json:"integration_id,omitempty"`
+	WorkspaceID   string `json:"workspace_id"`
 }
 
 // TestEmailProviderResponse is the response for testing an email provider

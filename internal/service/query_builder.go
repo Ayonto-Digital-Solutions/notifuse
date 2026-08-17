@@ -266,7 +266,9 @@ func (qb *QueryBuilder) parseContactConditions(contact *domain.ContactCondition,
 	var args []interface{}
 
 	for _, filter := range contact.Filters {
-		condition, newArgs, newArgIndex, err := qb.parseFilter(filter, argIndex)
+		// Segments: a value that cannot be cast fails the query outright, which is a
+		// person waiting on a report rather than a write path going down.
+		condition, newArgs, newArgIndex, err := qb.parseFilter(filter, argIndex, castDirectly)
 		if err != nil {
 			return "", nil, argIndex, err
 		}
@@ -288,7 +290,7 @@ func (qb *QueryBuilder) parseContactConditions(contact *domain.ContactCondition,
 }
 
 // parseFilter parses a single filter (field + operator + value)
-func (qb *QueryBuilder) parseFilter(filter *domain.DimensionFilter, argIndex int) (string, []interface{}, int, error) {
+func (qb *QueryBuilder) parseFilter(filter *domain.DimensionFilter, argIndex int, mode castMode) (string, []interface{}, int, error) {
 	if filter == nil {
 		return "", nil, argIndex, fmt.Errorf("filter cannot be nil")
 	}
@@ -301,7 +303,7 @@ func (qb *QueryBuilder) parseFilter(filter *domain.DimensionFilter, argIndex int
 
 	// Route JSON fields to specialized handler
 	if fieldCfg.fieldType == "json" {
-		return qb.buildJSONCondition(fieldCfg.dbColumn, filter, argIndex)
+		return qb.buildJSONCondition(fieldCfg.dbColumn, filter, argIndex, mode)
 	}
 
 	// Validate operator exists in whitelist
@@ -579,11 +581,18 @@ func (qb *QueryBuilder) parseTimelineFilter(filter *domain.DimensionFilter, argI
 	// database triggers populate as {field: {old, new}} (an insert only sets "new"). Read
 	// the "new" value — the resulting value of the change. (There is no "metadata" column;
 	// referencing one produced SQL that failed at execution.)
-	// Values here are written by the database triggers from typed columns, so they are uniform
-	// per key and a cast cannot be surprised by one odd row. Guarding them would also narrow
-	// which stored date formats still match, changing existing segments — so they are cast
-	// directly, unlike caller-supplied event properties below.
-	return qb.parseJSONBKeyFilter(filter, argIndex, "ct.changes->%s->>'new'", castDirectly)
+	// Cast defensively, not directly. That was safe while every value in `changes`
+	// came from a database trigger reading a typed column — uniform per key, so a
+	// cast could not meet an odd row. The web analytics projection broke that
+	// premise: it is an application writer, and several of its keys (path,
+	// landing_path, exit_path, referrer_domain, utm_*) hold text a visitor
+	// supplied to a public endpoint. A numeric or date operator against one of
+	// them — refused by the console, reachable through the API — would otherwise
+	// compile to (…)::numeric over free text and abort the whole statement, and
+	// whether the kind predicate filters the offending row first is plan-
+	// dependent. A segment would work until the planner changed its mind, then
+	// fail every recompute with its count frozen.
+	return qb.parseJSONBKeyFilter(filter, argIndex, "ct.changes->%s->>'new'", castDefensively)
 }
 
 // parseEventPropertyFilter parses a dimension filter against the custom_events.properties payload.
@@ -811,7 +820,7 @@ func (qb *QueryBuilder) buildCondition(dbColumn, operator string, sqlOp sqlOpera
 
 // buildJSONCondition builds SQL conditions for JSON/JSONB fields
 // Uses PostgreSQL 17 subscript notation and proper type casting
-func (qb *QueryBuilder) buildJSONCondition(dbColumn string, filter *domain.DimensionFilter, argIndex int) (string, []interface{}, int, error) {
+func (qb *QueryBuilder) buildJSONCondition(dbColumn string, filter *domain.DimensionFilter, argIndex int, mode castMode) (string, []interface{}, int, error) {
 	var args []interface{}
 
 	// Validate operator
@@ -855,7 +864,7 @@ func (qb *QueryBuilder) buildJSONCondition(dbColumn string, filter *domain.Dimen
 			return "", nil, argIndex, err
 		}
 		return qb.buildCondition(
-			fmt.Sprintf("(%s::text)::timestamptz", jsonPath), filter.Operator, sqlOp, values, argIndex)
+			castTimestamp(fmt.Sprintf("%s::text", jsonPath), mode), filter.Operator, sqlOp, values, argIndex)
 	}
 
 	// Handle array-specific operators
@@ -878,10 +887,10 @@ func (qb *QueryBuilder) buildJSONCondition(dbColumn string, filter *domain.Dimen
 		fieldExpr = fmt.Sprintf("%s::text", jsonPath)
 	case "number":
 		// Extract as text, then cast to numeric
-		fieldExpr = fmt.Sprintf("(%s::text)::numeric", jsonPath)
+		fieldExpr = castNumeric(fmt.Sprintf("%s::text", jsonPath), mode)
 	case "time":
 		// Extract as text, then cast to timestamptz
-		fieldExpr = fmt.Sprintf("(%s::text)::timestamptz", jsonPath)
+		fieldExpr = castTimestamp(fmt.Sprintf("%s::text", jsonPath), mode)
 	default:
 		return "", nil, argIndex, fmt.Errorf("invalid field_type for JSON field: %s", filter.FieldType)
 	}
@@ -1120,7 +1129,13 @@ func (qb *QueryBuilder) parseContactConditionsForTrigger(contact *domain.Contact
 	var args []interface{}
 
 	for _, filter := range contact.Filters {
-		condition, newArgs, newArgIndex, err := qb.parseFilter(filter, argIndex)
+		// Triggers: cast defensively. This expression runs inside a trigger function on
+		// contact_timeline, which is written by triggers on contacts, contact_lists,
+		// message_history, custom_events, contact_segments and inbound_webhook_events — so a
+		// cast that raises takes all of those writes down for the contact concerned, and the
+		// install probe cannot foresee it because EXPLAIN plans without executing. A contact
+		// whose custom_json value does not convert simply does not match.
+		condition, newArgs, newArgIndex, err := qb.parseFilter(filter, argIndex, castDefensively)
 		if err != nil {
 			return "", nil, argIndex, err
 		}
@@ -1331,7 +1346,14 @@ func (qb *QueryBuilder) parseCustomEventsGoalConditionWithEmailRef(goal *domain.
 		conditions = append(conditions, fmt.Sprintf("ce.goal_type = $%d", argIndex))
 		argIndex++
 	} else {
-		// For wildcard, just ensure goal_type is set
+		// Wildcard: the row must carry a type. Deliberate, not lazy.
+		//
+		// Untyped rows are made matchable by stamping goal_type at WRITE time
+		// (web_analytics_contact_bridge.go), never by relaxing this predicate.
+		// Relaxing it would change SQL already frozen in segments.generated_sql and
+		// in installed automation trigger functions, so it needs a recompile
+		// migration (v36 and v37 are the precedent) — and it would bypass the
+		// partial index at database/init.go:367, which is WHERE goal_type IS NOT NULL.
 		conditions = append(conditions, "ce.goal_type IS NOT NULL")
 	}
 

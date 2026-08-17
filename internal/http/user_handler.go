@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -231,6 +232,16 @@ func (h *UserHandler) GetCurrentUser(w http.ResponseWriter, r *http.Request) {
 		// Verify session exists (this will fail if user logged out)
 		_, err := h.userService.VerifyUserSession(ctx, userID, sessionID)
 		if err != nil {
+			// Only a genuine authentication failure may answer 401. The console
+			// treats any 401 as "your session is gone": it deletes the stored token
+			// and redirects to the sign-in page, discarding the current URL. A
+			// database blip must not have that effect, so it surfaces as a 500 and
+			// leaves the caller signed in.
+			if !errors.Is(err, domain.ErrSessionAuthFailed) {
+				WriteJSONError(w, "Failed to verify session", http.StatusInternalServerError)
+				h.tracer.MarkSpanError(ctx, err)
+				return
+			}
 			WriteJSONError(w, "Session expired or invalid", http.StatusUnauthorized)
 			span.SetStatus(trace.Status{
 				Code:    trace.StatusCodeUnauthenticated,
@@ -269,6 +280,12 @@ func (h *UserHandler) GetCurrentUser(w http.ResponseWriter, r *http.Request) {
 
 	// Add workspace count to span for context
 	span.AddAttributes(trace.Int64Attribute("workspaces.count", int64(len(workspaces))))
+
+	// Credentials are decrypted on load for the sending path; they must not
+	// leave the process. See domain.Workspace.Redact.
+	for _, ws := range workspaces {
+		ws.Redact()
+	}
 
 	// Combine user and workspaces in response
 	response := map[string]interface{}{

@@ -1,15 +1,9 @@
 import { router } from '../../router'
 
-export class ApiError extends Error {
-  constructor(
-    message: string,
-    public status: number,
-    public data?: unknown
-  ) {
-    super(message)
-    this.name = 'ApiError'
-  }
-}
+// Defined in ./errors so it can be imported without pulling in the router; re-exported
+// here because most call sites already import it from this module.
+export { ApiError } from './errors'
+import { ApiError } from './errors'
 
 async function handleResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
@@ -22,7 +16,17 @@ async function handleResponse<T>(response: Response): Promise<T> {
     ) {
       localStorage.removeItem('auth_token')
 
-      router.navigate({ to: '/console/signin' })
+      // A 401 also lands while the sign-in page itself is booting: a stale token in
+      // localStorage makes AuthContext's opening user.me call fail. Navigating from
+      // there rewrites the address bar to a bare /console/signin, and since the
+      // router does not carry search params across a navigate, it drops the query
+      // string the page still needs — ?email= is what drives the one-click sign-in
+      // link. The visitor lands on an empty form, and only the next attempt works,
+      // because this handler has meanwhile cleared the token. Already being on the
+      // sign-in route means there is nowhere to send them anyway.
+      if (window.location.pathname !== '/console/signin') {
+        router.navigate({ to: '/console/signin' })
+      }
     }
 
     throw new ApiError(errorData?.error || 'An error occurred', response.status, errorData)

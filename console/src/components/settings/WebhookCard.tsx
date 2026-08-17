@@ -260,6 +260,11 @@ export function WebhookCard({
         </div>
         <div className="flex items-center gap-2 mb-3">
           <span className="text-gray-500 text-sm">{t`Secret:`}</span>
+          {!webhook.secret ? (
+            <span className="text-gray-400 text-sm italic flex-1">
+              {t`Only a workspace owner can view or rotate the signing secret`}
+            </span>
+          ) : (
           <Space.Compact className="flex-1">
             <Input
               size="small"
@@ -290,6 +295,7 @@ export function WebhookCard({
               </Button>
             </Tooltip>
           </Space.Compact>
+          )}
         </div>
         <Divider className="my-6!" />
         <div className="flex justify-between items-center mb-4">
@@ -327,7 +333,7 @@ export function WebhookCard({
         <div style={{ columnCount: 3, columnGap: '1rem' }}>
           {(webhook.settings.event_types || []).map((type) => (
             <div key={type} style={{ breakInside: 'avoid' }}>
-              <Tag bordered={false} color="green" className="text-xs !mb-1">
+              <Tag variant="filled" color="green" className="text-xs !mb-1">
                 {formatEventType(type)}
               </Tag>
             </div>

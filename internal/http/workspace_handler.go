@@ -20,6 +20,17 @@ type WorkspaceHandler struct {
 	getJWTSecret     func() ([]byte, error)
 	logger           logger.Logger
 	secretKey        string
+
+	// webAnalyticsCacheInvalidator, when set, drops the ingest path's cached
+	// settings of a workspace after they change.
+	webAnalyticsCacheInvalidator func(workspaceID string)
+}
+
+// WithWebAnalyticsCacheInvalidator wires the ingest settings-cache
+// invalidation callback (optional).
+func (h *WorkspaceHandler) WithWebAnalyticsCacheInvalidator(fn func(workspaceID string)) *WorkspaceHandler {
+	h.webAnalyticsCacheInvalidator = fn
+	return h
 }
 
 // NewWorkspaceHandler creates a new workspace handler
@@ -59,6 +70,7 @@ func (h *WorkspaceHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("/api/workspaces.setUserPermissions", requireAuth(http.HandlerFunc(h.handleSetUserPermissions)))
 	mux.Handle("/api/workspaces.setCustomFieldLabels", requireAuth(http.HandlerFunc(h.handleSetCustomFieldLabels)))
 	mux.Handle("/api/workspaces.setBlogSettings", requireAuth(http.HandlerFunc(h.handleSetBlogSettings)))
+	mux.Handle("/api/workspaces.setWebAnalyticsSettings", requireAuth(http.HandlerFunc(h.handleSetWebAnalyticsSettings)))
 
 	// Public invitation routes (no authentication required)
 	mux.Handle("/api/workspaces.verifyInvitationToken", http.HandlerFunc(h.handleVerifyInvitationToken))
@@ -82,6 +94,11 @@ func (h *WorkspaceHandler) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Credentials are decrypted on load for the sending path; they must not
+	// leave the process. See domain.Workspace.Redact.
+	for _, ws := range workspaces {
+		ws.Redact()
+	}
 	writeJSON(w, http.StatusOK, workspaces)
 }
 
@@ -135,6 +152,8 @@ func (h *WorkspaceHandler) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	workspace.Redact()
+
 	// Wrap the workspace in a response object with a workspace field to match frontend expectations
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"workspace": workspace,
@@ -184,6 +203,7 @@ func (h *WorkspaceHandler) handleCreate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	workspace.Redact()
 	writeJSON(w, http.StatusCreated, workspace)
 }
 
@@ -235,6 +255,7 @@ func (h *WorkspaceHandler) handleUpdate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	workspace.Redact()
 	writeJSON(w, http.StatusOK, workspace)
 }
 
@@ -411,8 +432,7 @@ func (h *WorkspaceHandler) handleSetCustomFieldLabels(w http.ResponseWriter, r *
 	}
 
 	if err := h.workspaceService.SetCustomFieldLabels(r.Context(), workspaceID, labels); err != nil {
-		if _, ok := err.(*domain.PermissionError); ok {
-			WriteJSONError(w, err.Error(), http.StatusForbidden)
+		if writePermissionError(w, err) {
 			return
 		}
 		if _, ok := err.(*domain.ErrUnauthorized); ok {
@@ -453,8 +473,7 @@ func (h *WorkspaceHandler) handleSetBlogSettings(w http.ResponseWriter, r *http.
 	}
 
 	if err := h.workspaceService.SetBlogSettings(r.Context(), workspaceID, enabled, settings); err != nil {
-		if _, ok := err.(*domain.PermissionError); ok {
-			WriteJSONError(w, err.Error(), http.StatusForbidden)
+		if writePermissionError(w, err) {
 			return
 		}
 		if _, ok := err.(*domain.ErrUnauthorized); ok {
@@ -469,6 +488,52 @@ func (h *WorkspaceHandler) handleSetBlogSettings(w http.ResponseWriter, r *http.
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":  "success",
 		"message": "Blog settings updated successfully",
+	})
+}
+
+// handleSetWebAnalyticsSettings replaces a workspace's web analytics settings
+// via the dedicated, web_analytics:write gated endpoint (mirrors the blog
+// settings pattern: members with the feature permission manage it without
+// workspace:write).
+func (h *WorkspaceHandler) handleSetWebAnalyticsSettings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		WriteJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req domain.SetWebAnalyticsSettingsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteJSONError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	workspaceID, settings, err := req.Validate()
+	if err != nil {
+		WriteJSONError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := h.workspaceService.SetWebAnalyticsSettings(r.Context(), workspaceID, settings); err != nil {
+		if writePermissionError(w, err) {
+			return
+		}
+		if _, ok := err.(*domain.ErrUnauthorized); ok {
+			WriteJSONError(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		h.logger.WithField("workspace_id", workspaceID).WithField("error", err.Error()).Error("Failed to set web analytics settings")
+		WriteJSONError(w, "Failed to set web analytics settings", http.StatusInternalServerError)
+		return
+	}
+
+	// The ingest path caches settings for a minute; apply changes promptly.
+	if h.webAnalyticsCacheInvalidator != nil {
+		h.webAnalyticsCacheInvalidator(workspaceID)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":  "success",
+		"message": "Web analytics settings updated successfully",
 	})
 }
 
@@ -741,6 +806,11 @@ func (h *WorkspaceHandler) handleVerifyInvitationToken(w http.ResponseWriter, r 
 		WriteJSONError(w, "Failed to get workspace", http.StatusInternalServerError)
 		return
 	}
+
+	// This route is public — no authentication at all (see RegisterRoutes) — so it
+	// redacts harder than the member-facing ones: no integrations, no credential
+	// hints, no S3 secret. The page shows the workspace's name.
+	workspace.RedactForPublic()
 
 	// Return invitation and workspace details
 	writeJSON(w, http.StatusOK, map[string]interface{}{

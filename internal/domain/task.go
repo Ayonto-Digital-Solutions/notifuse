@@ -66,9 +66,19 @@ type TaskState struct {
 	Message  string  `json:"message,omitempty"`
 
 	// Specialized states for different task types - only one will be used based on task type
-	SendBroadcast   *SendBroadcastState   `json:"send_broadcast,omitempty"`
-	BuildSegment    *BuildSegmentState    `json:"build_segment,omitempty"`
-	IntegrationSync *IntegrationSyncState `json:"integration_sync,omitempty"`
+	SendBroadcast        *SendBroadcastState        `json:"send_broadcast,omitempty"`
+	BuildSegment         *BuildSegmentState         `json:"build_segment,omitempty"`
+	IntegrationSync      *IntegrationSyncState      `json:"integration_sync,omitempty"`
+	WebAnalyticsBackfill *WebAnalyticsBackfillState `json:"web_analytics_backfill,omitempty"`
+}
+
+// WebAnalyticsBackfillState is the resumable state of an attribution-rules
+// backfill: partitions of web_sessions and web_goals rewritten one per step.
+type WebAnalyticsBackfillState struct {
+	FiltersVersion string   `json:"filters_version"`      // rule-set hash the run applies
+	Partitions     []string `json:"partitions,omitempty"` // remaining work, resolved at start
+	PartitionIndex int      `json:"partition_index"`
+	RowsUpdated    int64    `json:"rows_updated"`
 }
 
 // Value implements the driver.Valuer interface for TaskState
@@ -272,6 +282,16 @@ type TaskProcessor interface {
 	// context.WithCancel) as the returned error, or the task will retry
 	// forever. Bound internal work with context.WithTimeout instead, whose
 	// context.DeadlineExceeded is correctly treated as a real failure.
+	//
+	// Recurring tasks invert what "completed" reads like, and this catches
+	// people out. For a task with a RecurringInterval, completed=true does not
+	// mean "succeeded" — it means "this run is over, schedule the next one".
+	// So a TRANSIENT failure should return (true, nil) after recording the
+	// failure in the task state: the service then reschedules with backoff
+	// derived from that state. Returning an error instead marks the task
+	// failed and stops it recurring at all, which is what you want only for a
+	// permanent failure — bad credentials, a deleted resource — or once
+	// consecutive failures have gone past the point of being worth retrying.
 	Process(ctx context.Context, task *Task, timeoutAt time.Time) (completed bool, err error)
 
 	// CanProcess returns whether this processor can handle the given task type

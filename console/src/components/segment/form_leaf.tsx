@@ -13,6 +13,7 @@ import {
 } from '../../services/api/segment'
 import dayjs, { Dayjs } from 'dayjs'
 import { InputDimensionFilters } from './input_dimension_filters'
+import { timelineChangesSchema } from './table_schemas'
 import { InputEventPropertyFilters } from './input_event_property_filters'
 import TemplateSelectorInput from '../templates/TemplateSelectorInput'
 import BroadcastSelectorInput from './BroadcastSelectorInput'
@@ -128,7 +129,7 @@ export const LeafContactForm = (props: LeafFormProps) => {
         name="source"
         colon={false}
         label={
-          <Tag bordered={false} color="cyan">
+          <Tag variant="filled" color="cyan">
             {props.schema.icon && (
               <FontAwesomeIcon icon={props.schema.icon} style={{ marginRight: 8 }} />
             )}
@@ -200,7 +201,7 @@ export const LeafContactListForm = (props: LeafFormProps) => {
 
   return (
     <Space style={{ alignItems: 'start' }}>
-      <Tag bordered={false} color="cyan">
+      <Tag variant="filled" color="cyan">
         {props.schema.icon && (
           <FontAwesomeIcon icon={props.schema.icon} style={{ marginRight: 8 }} />
         )}
@@ -327,7 +328,7 @@ export const LeafActionForm = (props: LeafFormProps) => {
 
   return (
     <Space style={{ alignItems: 'start' }}>
-      <Tag bordered={false} color="cyan">
+      <Tag variant="filled" color="cyan">
         {props.schema.icon && (
           <FontAwesomeIcon icon={props.schema.icon} style={{ marginRight: 8 }} />
         )}
@@ -360,13 +361,32 @@ export const LeafActionForm = (props: LeafFormProps) => {
                 style={{ width: 200 }}
                 size="small"
                 placeholder={t`Select event`}
+                // Filters name keys of the SELECTED kind's payload, so they can
+                // never survive a kind change. preserve={false} does not cover
+                // this: both web kinds render the same Form.Item at the same
+                // position, so React reconciles it rather than unmounting it,
+                // and initialValues re-seeds it on the indirect route
+                // (web.pageview -> email.opened -> web.session). Clearing here
+                // is the only place that catches every path.
+                onChange={() => form.setFieldValue(['contact_timeline', 'filters'], [])}
+                // Closed list, and DUPLICATED in input.tsx (the summary renderer),
+                // which prints nothing at all for a kind it does not recognise.
+                // Add here and you must add there.
+                //
+                // This is a console limit, not a domain one: ContactTimelineCondition
+                // .Validate accepts any non-empty Kind, so an API-built
+                // custom_event.* condition validates, compiles and then renders
+                // blank in the UI. Custom events reach segments through the Custom
+                // Events Goal condition instead — do not document the Activity route.
                 options={[
                   { value: 'email.sent', label: t`New message (email...)` },
                   { value: 'email.opened', label: t`Open email` },
                   { value: 'email.clicked', label: t`Click email` },
                   { value: 'email.bounced', label: t`Bounce email` },
                   { value: 'email.complained', label: t`Complain email` },
-                  { value: 'email.unsubscribed', label: t`Unsubscribe from list` }
+                  { value: 'email.unsubscribed', label: t`Unsubscribe from list` },
+                  { value: 'web.pageview', label: t`View web page` },
+                  { value: 'web.session', label: t`Visit website` }
                 ]}
               />
             </Form.Item>
@@ -391,7 +411,7 @@ export const LeafActionForm = (props: LeafFormProps) => {
 
             return (
               <div className="mb-2">
-                <Space direction="vertical" size={4}>
+                <Space orientation="vertical" size={4}>
                   <Space>
                     <span className="opacity-60" style={{ lineHeight: '32px' }}>
                       {t`template`}
@@ -606,31 +626,49 @@ export const LeafActionForm = (props: LeafFormProps) => {
           </Space>
         </div>
 
-        {props.source === 'contact_events' && (
-          <div className="mt-2">
-            <Space style={{ alignItems: 'start' }}>
-              <span className="opacity-60" style={{ lineHeight: '32px' }}>
-                {t`with filters`}
-              </span>
-              <Form.Item
-                name={['contact_timeline', 'filters']}
-                noStyle
-                colon={false}
-                className="mt-3"
-                rules={[
-                  { required: false, type: 'array', min: 0, message: Messages.RequiredField }
-                ]}
-              >
-                <InputDimensionFilters
-                  schema={props.schema}
-                  btnType="link"
-                  btnGhost={true}
-                  customFieldLabels={props.customFieldLabels}
-                />
-              </Form.Item>
-            </Space>
-          </div>
-        )}
+        {/* Filters on the event's own payload.
+            Only the web kinds have one: a contact_timeline filter compiles to
+            `ct.changes->'<field>'->>'new'`, so the field list must be the keys
+            that kind writes into `changes` — props.schema describes the table's
+            columns, which are not in `changes` at all and would each match
+            nothing. Previously gated on a source value that never existed, so
+            this block had never rendered. */}
+        <Form.Item noStyle shouldUpdate>
+          {(funcs) => {
+            const kind = funcs.getFieldValue(['contact_timeline', 'kind'])
+            const changesSchema = timelineChangesSchema(kind)
+            if (!changesSchema) {
+              return null
+            }
+
+            return (
+              <div className="mt-2">
+                <Space style={{ alignItems: 'start' }}>
+                  <span className="opacity-60" style={{ lineHeight: '32px' }}>
+                    {t`with filters`}
+                  </span>
+                  <Form.Item
+                    name={['contact_timeline', 'filters']}
+                    noStyle
+                    colon={false}
+                    className="mt-3"
+                    rules={[
+                      { required: false, type: 'array', min: 0, message: Messages.RequiredField }
+                    ]}
+                    // Drop the filters when the kind changes to one that has no
+                    // filter block. They name keys of THAT kind's `changes`, so
+                    // carrying them over would submit a condition reading, say,
+                    // changes->'path' from an email row — matching nothing, with
+                    // nothing on screen to explain why.
+                    preserve={false}
+                  >
+                    <InputDimensionFilters schema={changesSchema} btnType="link" />
+                  </Form.Item>
+                </Space>
+              </div>
+            )
+          }}
+        </Form.Item>
 
         {/* CONFIRM / CANCEL */}
         <Space style={{ position: 'absolute', top: 16, right: 0 }}>
@@ -676,7 +714,7 @@ export const LeafCustomEventsGoalForm = (props: LeafFormProps) => {
 
   return (
     <Space style={{ alignItems: 'start' }}>
-      <Tag bordered={false} color="cyan">
+      <Tag variant="filled" color="cyan">
         {props.schema.icon && (
           <FontAwesomeIcon icon={props.schema.icon} style={{ marginRight: 8 }} />
         )}
@@ -960,7 +998,7 @@ export const LeafCustomEventsGoalForm = (props: LeafFormProps) => {
               {t`with properties`}
             </span>
             <Form.Item name={['custom_events_goal', 'filters']} noStyle colon={false}>
-              <InputEventPropertyFilters btnType="link" btnGhost={true} />
+              <InputEventPropertyFilters btnType="link" />
             </Form.Item>
           </Space>
         </div>

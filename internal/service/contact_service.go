@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 
 	"github.com/Notifuse/notifuse/internal/domain"
@@ -18,9 +17,26 @@ type ContactService struct {
 	inboundWebhookEventRepo domain.InboundWebhookEventRepository
 	contactListRepo         domain.ContactListRepository
 	contactTimelineRepo     domain.ContactTimelineRepository
+	// webAnalyticsRepo is optional: installs without the feature wired still
+	// delete contacts normally.
+	webAnalyticsRepo domain.WebAnalyticsRepository
+	// emailQueueRepo is nil only in test harnesses that do not exercise deletion;
+	// app wiring always supplies it.
+	emailQueueRepo          domain.EmailQueueRepository
+	customEventRepo         domain.CustomEventRepository
+	segmentRepo             domain.SegmentRepository
+	contactSegmentQueueRepo domain.ContactSegmentQueueRepository
 	logger                  logger.Logger
 }
 
+// NewContactService takes its dependencies positionally, which is defensible at
+// this arity only because the repository types are distinct interfaces — swapping
+// two of them does not compile.
+//
+// That stops being true if a fifth repository arrives, or if two of them ever
+// share a method set. At that point move to an options struct: the failure mode
+// otherwise is a purge that silently targets the wrong table, which no test would
+// catch because every mock would still be satisfied.
 func NewContactService(
 	repo domain.ContactRepository,
 	workspaceRepo domain.WorkspaceRepository,
@@ -29,6 +45,11 @@ func NewContactService(
 	inboundWebhookEventRepo domain.InboundWebhookEventRepository,
 	contactListRepo domain.ContactListRepository,
 	contactTimelineRepo domain.ContactTimelineRepository,
+	webAnalyticsRepo domain.WebAnalyticsRepository,
+	emailQueueRepo domain.EmailQueueRepository,
+	customEventRepo domain.CustomEventRepository,
+	segmentRepo domain.SegmentRepository,
+	contactSegmentQueueRepo domain.ContactSegmentQueueRepository,
 	logger logger.Logger,
 ) *ContactService {
 	return &ContactService{
@@ -39,6 +60,11 @@ func NewContactService(
 		inboundWebhookEventRepo: inboundWebhookEventRepo,
 		contactListRepo:         contactListRepo,
 		contactTimelineRepo:     contactTimelineRepo,
+		webAnalyticsRepo:        webAnalyticsRepo,
+		emailQueueRepo:          emailQueueRepo,
+		customEventRepo:         customEventRepo,
+		segmentRepo:             segmentRepo,
+		contactSegmentQueueRepo: contactSegmentQueueRepo,
 		logger:                  logger,
 	}
 }
@@ -139,7 +165,6 @@ func (s *ContactService) DeleteContact(ctx context.Context, workspaceID string, 
 	email = domain.NormalizeEmail(email)
 
 	var err error
-	log.Println("DeleteContact", email, workspaceID)
 	ctx, _, userWorkspace, err := s.authService.AuthenticateUserForWorkspace(ctx, workspaceID)
 	if err != nil {
 		return fmt.Errorf("failed to authenticate user: %w", err)
@@ -152,6 +177,24 @@ func (s *ContactService) DeleteContact(ctx context.Context, workspaceID string, 
 			domain.PermissionTypeWrite,
 			"Insufficient permissions: write access to contacts required",
 		)
+	}
+
+	// Queued mail goes first. Every other step below cleans up a row that already
+	// exists; this is the only one that stops something from still happening, and
+	// every moment it waits is a moment a worker can claim a row and send to the
+	// address we were asked to erase.
+	//
+	// Fatal on error: reporting a contact as deleted while their mail is still on
+	// its way to them is precisely the outcome this prevents.
+	//
+	// It does not close the window entirely. An entry already claimed by a worker
+	// is held in memory and will still send — stopping that needs a contact check
+	// in the send path itself, which costs a query per email.
+	if s.emailQueueRepo != nil {
+		if _, err := s.emailQueueRepo.DeleteForEmail(ctx, workspaceID, email); err != nil {
+			s.logger.WithField("email", email).Error(fmt.Sprintf("Failed to delete queued emails: %v", err))
+			return fmt.Errorf("failed to delete queued emails: %w", err)
+		}
 	}
 
 	// Delete related data first
@@ -170,15 +213,96 @@ func (s *ContactService) DeleteContact(ctx context.Context, workspaceID string, 
 		return fmt.Errorf("failed to delete contact list relationships: %w", err)
 	}
 
+	// The contact row goes first, and the order is load-bearing rather than
+	// stylistic. Wrapping this in a transaction has been proposed and is WRONG:
+	// inside one, the contact-row DELETE stays invisible to a concurrent buffered
+	// beat until commit, so the projection's EXISTS guard would still pass and
+	// re-insert timeline rows after the in-transaction purge had already run —
+	// reintroducing precisely the bug described below.
+	//
+	// These are separate statements, not one transaction, and the web
+	// analytics projection guards on EXISTS (SELECT 1 FROM contacts ...) — so
+	// while the row survives, a beat buffered before the deletion can still flush
+	// and re-insert the timeline rows just purged below, leaving a deleted
+	// person's browsing history behind with no contact to reach it from.
+	// Removing the row first makes that guard fail closed for anything in flight.
+	if err := s.repo.DeleteContact(ctx, workspaceID, email); err != nil {
+		// A contact row that is already gone must NOT abort the rest: the
+		// dependent rows are deleted after it, so a run that removed the contact
+		// and then failed part-way — a lock timeout, a dropped connection, an
+		// evicted pod — can only be finished by retrying, and the repository
+		// reports a zero-row delete as "contact not found". Short-circuiting here
+		// would leave that contact's timeline and their address on the web
+		// analytics rows with no supported way to remove either, since nothing
+		// cascades from contacts.
+		if !strings.Contains(err.Error(), "contact not found") {
+			s.logger.WithField("email", email).Error(fmt.Sprintf("Failed to delete contact: %v", err))
+			return fmt.Errorf("failed to delete contact: %w", err)
+		}
+		s.logger.WithField("email", email).
+			Info("Contact row already absent; continuing with dependent cleanup")
+	}
+
+	// Deleting these does not corrupt revenue reporting, which is worth stating
+	// because the web analytics comment below makes the opposite argument for its
+	// own table. custom_events is read only per-contact — repository lists, and the
+	// EXISTS subquery for segment membership — while workspace revenue dashboards
+	// aggregate web_goals, whose goal_value is untouched here. So this destroys
+	// only the erased contact's own history, exactly as contact_timeline already does.
+	//
+	// custom_events carries the address in a NOT NULL column, so it cannot be
+	// anonymised in place. Deleted rather than soft-deleted: the table has two
+	// AFTER INSERT OR UPDATE triggers, so an UPDATE would re-insert timeline rows
+	// for the address whose timeline is about to be purged, and fan the deleted
+	// person's event out to webhook subscribers. A plain DELETE fires neither.
+	if s.customEventRepo != nil {
+		if err := s.customEventRepo.DeleteForEmail(ctx, workspaceID, email); err != nil {
+			s.logger.WithField("email", email).Error(fmt.Sprintf("Failed to delete custom events: %v", err))
+			return fmt.Errorf("failed to delete custom events: %w", err)
+		}
+	}
+
+	// ORDERING, and it is a two-hop cascade rather than a preference:
+	//
+	//   contact_segments DELETE
+	//     -> contact_segment_changes_trigger INSERTs a segment.left row into
+	//        contact_timeline carrying OLD.email
+	//        -> contact_timeline_queue_trigger INSERTs that address into
+	//           contact_segment_queue
+	//
+	// So this runs BEFORE the timeline purge below — after it, the purge would
+	// have already run and the address would sit back on a timeline that reads as
+	// cleared — and the queue purge runs AFTER, once the rows the cascade creates
+	// actually exist.
+	if s.segmentRepo != nil {
+		if err := s.segmentRepo.DeleteForEmail(ctx, workspaceID, email); err != nil {
+			s.logger.WithField("email", email).Error(fmt.Sprintf("Failed to delete contact segments: %v", err))
+			return fmt.Errorf("failed to delete contact segments: %w", err)
+		}
+	}
+
 	if err := s.contactTimelineRepo.DeleteForEmail(ctx, workspaceID, email); err != nil {
 		s.logger.WithField("email", email).Error(fmt.Sprintf("Failed to delete contact timeline: %v", err))
 		return fmt.Errorf("failed to delete contact timeline: %w", err)
 	}
 
-	// Finally delete the contact
-	if err := s.repo.DeleteContact(ctx, workspaceID, email); err != nil {
-		s.logger.WithField("email", email).Error(fmt.Sprintf("Failed to delete contact: %v", err))
-		return fmt.Errorf("failed to delete contact: %w", err)
+	// Last, for the cascade reason above. Also sweeps anything the queue
+	// processor was mid-flight on.
+	if s.contactSegmentQueueRepo != nil {
+		if err := s.contactSegmentQueueRepo.RemoveFromQueue(ctx, workspaceID, email); err != nil {
+			s.logger.WithField("email", email).Error(fmt.Sprintf("Failed to remove contact from the segment queue: %v", err))
+			return fmt.Errorf("failed to remove contact from the segment queue: %w", err)
+		}
+	}
+
+	// Web analytics rows are anonymized rather than deleted: once the address is
+	// gone they are ordinary anonymous traffic, and removing them would rewrite
+	// historical session and pageview totals. Best-effort — the feature may not
+	// be enabled, and a contact deletion must not fail because analytics did.
+	if s.webAnalyticsRepo != nil {
+		if err := s.webAnalyticsRepo.AnonymizeContact(ctx, workspaceID, email); err != nil {
+			s.logger.WithField("email", email).Error(fmt.Sprintf("Failed to anonymize web analytics rows: %v", err))
+		}
 	}
 
 	return nil

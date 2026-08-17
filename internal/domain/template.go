@@ -38,7 +38,13 @@ func validateTemplateID(id string) error {
 	return nil
 }
 
-// Channel constants for templates
+// Channel constants for templates.
+//
+// A template's channel is a classification, not a filter: it decides which content
+// object the template must carry, which Validate enforces below, and it scopes the
+// template list. It is unrelated to the per-block visibility feature that was
+// removed — that shared the word "channel" and nothing else, so finding a leftover
+// of that removal here is a false trail.
 const (
 	ChannelEmail = "email"
 	ChannelWeb   = "web"
@@ -849,6 +855,18 @@ type ErrTemplateNotFound struct {
 }
 
 func (e *ErrTemplateNotFound) Error() string {
+	return e.Message
+}
+
+// ErrTemplateExists is returned on a UNIQUE violation (PG 23505) of the templates
+// primary key (id, version). Creation always writes version 1, so this means the id
+// is taken. The handler turns it into a 400 naming the id; without it the caller gets
+// a 500 and no way to learn the id is already in use.
+type ErrTemplateExists struct {
+	Message string
+}
+
+func (e *ErrTemplateExists) Error() string {
 	return e.Message
 }
 

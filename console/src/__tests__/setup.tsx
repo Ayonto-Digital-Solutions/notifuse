@@ -1,4 +1,4 @@
-import { afterEach, vi } from 'vitest'
+import { afterAll, afterEach, vi } from 'vitest'
 import { cleanup } from '@testing-library/react'
 import '@testing-library/jest-dom/vitest'
 import { i18n } from '@lingui/core'
@@ -21,10 +21,10 @@ vi.mock('@lingui/react/macro', () => ({
       }, '')
       // Use i18n._ to get the translation (simulates real macro behavior)
       // The values are passed as an object with numeric keys
-      const valuesObj = values.reduce((acc, val, idx) => {
+      const valuesObj = values.reduce<Record<string, unknown>>((acc, val, idx) => {
         acc[idx] = val
         return acc
-      }, {} as Record<number, unknown>)
+      }, {})
       return i18n._(messageId, valuesObj)
     },
     i18n,
@@ -77,6 +77,16 @@ Object.defineProperty(window, 'matchMedia', {
   }))
 })
 
+// Mock ResizeObserver for Ant Design components that measure themselves
+// (Input.TextArea with showCount/autoSize, Select dropdowns); jsdom has none.
+globalThis.ResizeObserver =
+  globalThis.ResizeObserver ??
+  class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+
 // Mock window.getComputedStyle for Ant Design components
 window.getComputedStyle = () => {
   return {
@@ -95,7 +105,11 @@ window.getComputedStyle = () => {
 
 // Mock HTMLCanvasElement.getContext for emoji-related packages
 const originalGetContext = HTMLCanvasElement.prototype.getContext
-HTMLCanvasElement.prototype.getContext = function(contextId: string, options?: unknown) {
+HTMLCanvasElement.prototype.getContext = function(
+  this: HTMLCanvasElement,
+  contextId: string,
+  options?: unknown
+) {
   if (contextId === '2d') {
     return {
       canvas: this,
@@ -161,4 +175,24 @@ vi.mock('@tanstack/react-router', async () => {
 // Clean up after each test
 afterEach(() => {
   cleanup()
+})
+
+// Let anything still scheduled fire before vitest tears the environment down.
+//
+// vitest.config.ts sets no `pool`, so `isolate: true` disposes the jsdom
+// environment after EVERY file, and antd's Form.Item debounce arms a 10ms timer
+// in @rc-component/util's useDelayState that the hook never cancels on unmount —
+// it exposes cancelPending and calls it from nowhere. cleanup() cannot help: it
+// unmounts the tree, and the timer was never registered against it. When that
+// timer lands after teardown it throws "window is not defined" as an unhandled
+// error, and vitest fails the whole run regardless of assertions.
+//
+// A real-time wait, not fake timers: the point is to let the real 10ms elapse.
+// It runs after the file's last test and last cleanup(), so no test can observe
+// it, and 63 files x 50ms is inside run-to-run noise.
+//
+// This neutralises the leak rather than removing it. Removing it means patching
+// useDelayState to cancel on unmount, upstream.
+afterAll(async () => {
+  await new Promise((resolve) => setTimeout(resolve, 50))
 })

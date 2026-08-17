@@ -497,6 +497,39 @@ func InitializeWorkspaceDatabase(db *sql.DB) error {
 		}
 	}
 
+	// Web analytics: partitioned parents (shared DDL with the v38 migration)
+	// plus the current and next monthly partitions so ingestion works
+	// immediately; the maintenance worker keeps creating them afterwards.
+	for _, query := range schema.WebAnalyticsTableDefinitions() {
+		if _, err := db.Exec(query); err != nil {
+			return fmt.Errorf("failed to create web analytics table: %w", err)
+		}
+	}
+	// Annotations: dated markers drawn over the analytics charts (shared DDL
+	// with the v38 migration). Not partitioned, so no partition bootstrap.
+	for _, query := range schema.AnnotationsTableDefinitions() {
+		if _, err := db.Exec(query); err != nil {
+			return fmt.Errorf("failed to create annotations table: %w", err)
+		}
+	}
+	// Monthly usage snapshots and the index the timeline meter counts through
+	// (shared DDL with the v38 migration). Must run after contact_timeline
+	// above, since the index is on it.
+	for _, query := range schema.UsageTableDefinitions() {
+		if _, err := db.Exec(query); err != nil {
+			return fmt.Errorf("failed to create usage table: %w", err)
+		}
+	}
+
+	currentMonth := time.Now().UTC()
+	for _, month := range []time.Time{currentMonth, currentMonth.AddDate(0, 1, 0)} {
+		for _, table := range schema.WebAnalyticsTableNames {
+			if _, err := db.Exec(schema.WebAnalyticsPartitionDDL(table, month)); err != nil {
+				return fmt.Errorf("failed to create web analytics partition: %w", err)
+			}
+		}
+	}
+
 	// Create trigger functions and triggers for contact timeline
 	triggerQueries := []string{
 		// Contact changes trigger function
@@ -1136,175 +1169,12 @@ func InitializeWorkspaceDatabase(db *sql.DB) error {
 		`DROP TRIGGER IF EXISTS webhook_message_history ON message_history`,
 		`CREATE TRIGGER webhook_message_history AFTER INSERT OR UPDATE ON message_history FOR EACH ROW EXECUTE FUNCTION webhook_message_history_trigger()`,
 		// Trigger 5: custom_events table - custom events with filtering
-		`CREATE OR REPLACE FUNCTION webhook_custom_events_trigger()
-		RETURNS TRIGGER AS $$
-		DECLARE
-			sub RECORD;
-			custom_filters JSONB;
-			should_deliver BOOLEAN;
-			payload JSONB;
-			event_kind VARCHAR(50);
-			subscribed_event_type VARCHAR(50);
-		BEGIN
-			-- Determine event kind based on operation and soft-delete status
-			IF TG_OP = 'INSERT' THEN
-				-- New record - check if it's being created as deleted
-				IF NEW.deleted_at IS NOT NULL THEN
-					event_kind := 'custom_event.deleted';
-					subscribed_event_type := 'custom_event.deleted';
-				ELSE
-					event_kind := 'custom_event.created';
-					subscribed_event_type := 'custom_event.created';
-				END IF;
-			ELSIF TG_OP = 'UPDATE' THEN
-				-- Check for soft-delete: was not deleted, now is deleted
-				IF (OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL) THEN
-					event_kind := 'custom_event.deleted';
-					subscribed_event_type := 'custom_event.deleted';
-				-- Check for restore: was deleted, now is not deleted
-				ELSIF (OLD.deleted_at IS NOT NULL AND NEW.deleted_at IS NULL) THEN
-					event_kind := 'custom_event.created';
-					subscribed_event_type := 'custom_event.created';
-				-- Regular update (skip if record is deleted)
-				ELSIF NEW.deleted_at IS NULL THEN
-					event_kind := 'custom_event.updated';
-					subscribed_event_type := 'custom_event.updated';
-				ELSE
-					-- Record is deleted and staying deleted, skip
-					RETURN NEW;
-				END IF;
-			ELSE
-				RETURN NEW;
-			END IF;
-
-			-- Build payload with full custom_event object
-			payload := jsonb_build_object('custom_event', to_jsonb(NEW));
-
-			-- Find matching subscriptions with the correct event type
-			FOR sub IN
-				SELECT id, settings FROM webhook_subscriptions
-				WHERE enabled = true AND subscribed_event_type = ANY(ARRAY(SELECT jsonb_array_elements_text(settings->'event_types')))
-			LOOP
-				should_deliver := true;
-				custom_filters := sub.settings->'custom_event_filters';
-
-				-- Apply goal_types filter if specified
-				IF custom_filters IS NOT NULL AND custom_filters ? 'goal_types'
-				   AND jsonb_array_length(custom_filters->'goal_types') > 0 THEN
-					IF NEW.goal_type IS NULL OR NOT (NEW.goal_type = ANY(
-						SELECT jsonb_array_elements_text(custom_filters->'goal_types')
-					)) THEN
-						should_deliver := false;
-					END IF;
-				END IF;
-
-				-- Apply event_names filter if specified
-				IF should_deliver AND custom_filters IS NOT NULL AND custom_filters ? 'event_names'
-				   AND jsonb_array_length(custom_filters->'event_names') > 0 THEN
-					IF NOT (NEW.event_name = ANY(
-						SELECT jsonb_array_elements_text(custom_filters->'event_names')
-					)) THEN
-						should_deliver := false;
-					END IF;
-				END IF;
-
-				IF should_deliver THEN
-					INSERT INTO webhook_deliveries (id, subscription_id, event_type, payload, status, attempts, max_attempts, next_attempt_at)
-					VALUES (gen_random_uuid()::text, sub.id, event_kind, payload, 'pending', 0, 10, NOW());
-				END IF;
-			END LOOP;
-			RETURN NEW;
-		END;
-		$$ LANGUAGE plpgsql`,
+		schema.WebhookCustomEventsTriggerFunction(),
 		`DROP TRIGGER IF EXISTS webhook_custom_events ON custom_events`,
 		`CREATE TRIGGER webhook_custom_events AFTER INSERT OR UPDATE ON custom_events FOR EACH ROW EXECUTE FUNCTION webhook_custom_events_trigger()`,
-		// Automation enroll contact function
-		`CREATE OR REPLACE FUNCTION automation_enroll_contact(
-			p_automation_id VARCHAR(36),
-			p_contact_email VARCHAR(255),
-			p_root_node_id VARCHAR(36),
-			p_frequency VARCHAR(20)
-		) RETURNS VOID AS $$
-		DECLARE
-			v_already_triggered BOOLEAN;
-			v_new_id VARCHAR(36);
-		BEGIN
-			-- 1. For "once" frequency, check if already triggered
-			IF p_frequency = 'once' THEN
-				SELECT EXISTS(
-					SELECT 1 FROM automation_trigger_log
-					WHERE automation_id = p_automation_id
-					AND contact_email = p_contact_email
-				) INTO v_already_triggered;
-
-				IF v_already_triggered THEN
-					RETURN;  -- Already triggered for this contact, skip
-				END IF;
-
-				-- Record trigger for deduplication
-				INSERT INTO automation_trigger_log (id, automation_id, contact_email, triggered_at)
-				VALUES (gen_random_uuid()::text, p_automation_id, p_contact_email, NOW())
-				ON CONFLICT (automation_id, contact_email) DO NOTHING;
-			END IF;
-
-			-- 2. Generate new ID for contact_automation
-			v_new_id := gen_random_uuid()::text;
-
-			-- 3. Enroll contact in automation
-			INSERT INTO contact_automations (
-				id, automation_id, contact_email, current_node_id,
-				status, entered_at, scheduled_at
-			) VALUES (
-				v_new_id,
-				p_automation_id,
-				p_contact_email,
-				p_root_node_id,
-				'active',
-				NOW(),
-				NOW()
-			);
-
-			-- 4. Increment enrolled stat
-			UPDATE automations
-			SET stats = jsonb_set(
-				COALESCE(stats, '{}'::jsonb),
-				'{enrolled}',
-				to_jsonb(COALESCE((stats->>'enrolled')::int, 0) + 1)
-			),
-			updated_at = NOW()
-			WHERE id = p_automation_id;
-
-			-- 5. Log node execution entry
-			INSERT INTO automation_node_executions (
-				id, contact_automation_id, automation_id, node_id, node_type, action, entered_at, output
-			) VALUES (
-				gen_random_uuid()::text,
-				v_new_id,
-				p_automation_id,
-				p_root_node_id,
-				'trigger',
-				'entered',
-				NOW(),
-				'{}'::jsonb
-			);
-
-			-- 6. Create automation.start timeline event
-			INSERT INTO contact_timeline (email, operation, entity_type, kind, entity_id, changes, created_at)
-			VALUES (
-				p_contact_email,
-				'insert',
-				'automation',
-				'automation.start',
-				p_automation_id,
-				jsonb_build_object(
-					'automation_id', jsonb_build_object('new', p_automation_id),
-					'root_node_id', jsonb_build_object('new', p_root_node_id)
-				),
-				NOW()
-			);
-
-		END;
-		$$ LANGUAGE plpgsql`,
+		// Automation enroll contact function, shared with the v38 migration so an
+		// upgraded workspace and a fresh one enrol identically.
+		schema.AutomationEnrollContactFunction(),
 	}
 
 	for _, query := range triggerQueries {

@@ -384,7 +384,7 @@ func TestUserHandler_GetCurrentUser_WithSessionVerification(t *testing.T) {
 	t.Run("unauthorized when session verification fails", func(t *testing.T) {
 		mockUserSvc.EXPECT().
 			VerifyUserSession(gomock.Any(), userID, sessionID).
-			Return(nil, fmt.Errorf("session not found"))
+			Return(nil, fmt.Errorf("%w: session not found", domain.ErrSessionAuthFailed))
 
 		req := httptest.NewRequest(http.MethodGet, "/api/user.me", nil)
 		ctx := context.WithValue(req.Context(), domain.UserIDKey, userID)
@@ -400,6 +400,30 @@ func TestUserHandler_GetCurrentUser_WithSessionVerification(t *testing.T) {
 		err := json.NewDecoder(rec.Body).Decode(&response)
 		require.NoError(t, err)
 		assert.Equal(t, "Session expired or invalid", response["error"])
+	})
+
+	// A 401 makes the console delete the stored token and leave the page it is on,
+	// so an unanswerable session lookup — a database blip, not a rejected caller —
+	// must not be reported that way.
+	t.Run("server error when session verification is unanswerable", func(t *testing.T) {
+		mockUserSvc.EXPECT().
+			VerifyUserSession(gomock.Any(), userID, sessionID).
+			Return(nil, fmt.Errorf("pq: password authentication failed for user"))
+
+		req := httptest.NewRequest(http.MethodGet, "/api/user.me", nil)
+		ctx := context.WithValue(req.Context(), domain.UserIDKey, userID)
+		ctx = context.WithValue(ctx, domain.UserTypeKey, string(domain.UserTypeUser))
+		ctx = context.WithValue(ctx, domain.SessionIDKey, sessionID)
+		req = req.WithContext(ctx)
+		rec := httptest.NewRecorder()
+
+		handler.GetCurrentUser(rec, req)
+
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
+		var response map[string]interface{}
+		err := json.NewDecoder(rec.Body).Decode(&response)
+		require.NoError(t, err)
+		assert.Equal(t, "Failed to verify session", response["error"])
 	})
 
 	t.Run("unauthorized when session ID missing for user type", func(t *testing.T) {
@@ -834,4 +858,53 @@ func TestUserHandler_RegisterRoutes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// user.me returns every workspace the caller belongs to, each with its
+// integrations. It is the widest of the workspace-serialising endpoints — one
+// call, all workspaces — and it lives in a different handler from the others, so
+// it is the one a reviewer of workspace_handler.go would never see.
+func TestUserHandler_GetCurrentUserRedactsCredentials(t *testing.T) {
+	handler, mockUserSvc, mockWorkspaceSvc, _ := setupUserHandlerTest(t)
+
+	const userID = "test-user"
+	const smtpPassword = "SENTINEL-user-me-smtp-password"
+
+	workspaceWithSecret := func(id string) *domain.Workspace {
+		return &domain.Workspace{
+			ID:   id,
+			Name: "Acme",
+			Integrations: domain.Integrations{{
+				ID:   "int-1",
+				Type: domain.IntegrationTypeEmail,
+				EmailProvider: domain.EmailProvider{
+					Kind: domain.EmailProviderKindSMTP,
+					SMTP: &domain.SMTPSettings{
+						Host:              "smtp.example.com",
+						Password:          smtpPassword,
+						EncryptedPassword: "ciphertext",
+					},
+				},
+			}},
+		}
+	}
+
+	mockUserSvc.EXPECT().
+		GetUserByID(gomock.Any(), userID).
+		Return(&domain.User{ID: userID, Email: "u@example.com"}, nil)
+	mockWorkspaceSvc.EXPECT().
+		ListWorkspaces(gomock.Any()).
+		Return([]*domain.Workspace{workspaceWithSecret("ws1"), workspaceWithSecret("ws2")}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/user.me", nil)
+	req = req.WithContext(context.WithValue(req.Context(), domain.UserIDKey, userID))
+	rec := httptest.NewRecorder()
+
+	handler.GetCurrentUser(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	body := rec.Body.String()
+	assert.NotContains(t, body, smtpPassword, "a decrypted credential reached /api/user.me")
+	assert.Contains(t, body, "ciphertext", "the encrypted form still goes out, so the console can tell configured from unset")
+	assert.Contains(t, body, "smtp.example.com", "non-secret context survives")
 }

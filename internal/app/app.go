@@ -24,11 +24,13 @@ import (
 	"github.com/Notifuse/notifuse/internal/service/queue"
 	"github.com/Notifuse/notifuse/pkg/cache"
 	pkgDatabase "github.com/Notifuse/notifuse/pkg/database"
+	"github.com/Notifuse/notifuse/pkg/geoip"
 	"github.com/Notifuse/notifuse/pkg/logger"
 	"github.com/Notifuse/notifuse/pkg/mailer"
 	"github.com/Notifuse/notifuse/pkg/ratelimiter"
 	"github.com/Notifuse/notifuse/pkg/smtp_bridge"
 	"github.com/Notifuse/notifuse/pkg/tracing"
+	webanalyticssdk "github.com/Notifuse/notifuse/web_analytics_sdk"
 
 	"contrib.go.opencensus.io/integrations/ocsql"
 )
@@ -66,6 +68,9 @@ type AppInterface interface {
 	GetEmailQueueWorker() *queue.EmailQueueWorker
 	GetAutomationScheduler() *service.AutomationScheduler
 	GetTaskScheduler() *service.TaskScheduler
+	GetWebAnalyticsBuffer() *service.WebAnalyticsBuffer
+	GetWebAnalyticsRepository() domain.WebAnalyticsRepository
+	GetCustomEventRepository() domain.CustomEventRepository
 
 	// Server status methods
 	IsServerCreated() bool
@@ -122,6 +127,8 @@ type App struct {
 	webhookDeliveryRepo           domain.WebhookDeliveryRepository
 	automationRepo                domain.AutomationRepository
 	emailQueueRepo                domain.EmailQueueRepository
+	webAnalyticsRepo              domain.WebAnalyticsRepository
+	annotationRepo                domain.AnnotationRepository
 
 	// Services
 	authService                      *service.AuthService
@@ -154,6 +161,7 @@ type App struct {
 	taskScheduler                    *service.TaskScheduler
 	dnsVerificationService           *service.DNSVerificationService
 	customEventService               *service.CustomEventService
+	annotationService                *service.AnnotationService
 	webhookSubscriptionService       *service.WebhookSubscriptionService
 	webhookDeliveryWorker            *service.WebhookDeliveryWorker
 	automationService                *service.AutomationService
@@ -161,14 +169,18 @@ type App struct {
 	llmService                       *service.LLMService
 	emailQueueWorker                 *queue.EmailQueueWorker
 	dataFeedFetcher                  broadcast.DataFeedFetcher
+	webAnalyticsService              *service.WebAnalyticsService
+	webAnalyticsBuffer               *service.WebAnalyticsBuffer
+	webAnalyticsMaintenanceWorker    *service.WebAnalyticsMaintenanceWorker
+	usageService                     *service.UsageService
 	// providers
-	postmarkService  *service.PostmarkService
-	mailgunService   *service.MailgunService
-	mailjetService   *service.MailjetService
-	sparkPostService *service.SparkPostService
-	sesService       *service.SESService
+	postmarkService     *service.PostmarkService
+	mailgunService      *service.MailgunService
+	mailjetService      *service.MailjetService
+	sparkPostService    *service.SparkPostService
+	sesService          *service.SESService
 	sesDiscoveryService *service.SESDiscoveryService
-	sendGridService  *service.SendGridService
+	sendGridService     *service.SendGridService
 
 	// Cache
 	blogCache         cache.Cache // Dedicated cache for blog rendering
@@ -425,7 +437,8 @@ func (a *App) InitRepositories() error {
 	a.messageHistoryRepo = repository.NewMessageHistoryRepository(a.workspaceRepo)
 	a.inboundWebhookEventRepo = repository.NewInboundWebhookEventRepository(a.workspaceRepo)
 	a.telemetryRepo = repository.NewTelemetryRepository(a.workspaceRepo)
-	a.analyticsRepo = repository.NewAnalyticsRepository(a.workspaceRepo, a.logger)
+	a.analyticsRepo = repository.NewAnalyticsRepository(a.workspaceRepo, a.logger, a.config.AnalyticsWorkMem)
+	a.webAnalyticsRepo = repository.NewWebAnalyticsRepository(a.workspaceRepo, a.logger)
 	a.contactTimelineRepo = repository.NewContactTimelineRepository(a.workspaceRepo)
 	a.segmentRepo = repository.NewSegmentRepository(a.workspaceRepo)
 	a.contactSegmentQueueRepo = repository.NewContactSegmentQueueRepository(a.workspaceRepo)
@@ -433,6 +446,7 @@ func (a *App) InitRepositories() error {
 	a.blogPostRepo = repository.NewBlogPostRepository(a.workspaceRepo)
 	a.blogThemeRepo = repository.NewBlogThemeRepository(a.workspaceRepo)
 	a.customEventRepo = repository.NewCustomEventRepository(a.workspaceRepo)
+	a.annotationRepo = repository.NewAnnotationRepository(a.workspaceRepo)
 	a.webhookSubscriptionRepo = repository.NewWebhookSubscriptionRepository(a.workspaceRepo)
 	a.webhookDeliveryRepo = repository.NewWebhookDeliveryRepository(a.workspaceRepo)
 
@@ -485,6 +499,15 @@ func (a *App) InitServices() error {
 	a.rateLimiter.SetPolicy("subscribe:ip", 50, 1*time.Minute)       // Public subscribe by IP
 	a.rateLimiter.SetPolicy("preferences:email", 20, 1*time.Minute)  // Public preferences by email
 	a.rateLimiter.SetPolicy("preferences:ip", 100, 1*time.Minute)    // Public preferences by IP
+	a.rateLimiter.SetPolicy("wa_identify:email", 120, 1*time.Minute) // Identified beats per contact (heartbeat is 10-30s)
+	a.rateLimiter.SetPolicy("wa_identify:ip", 600, 1*time.Minute)    // Identified beats per source IP (offices share one)
+	// Contact creation through /track, per workspace. The two limits above bound
+	// how often ONE address beats, which a caller minting a fresh address per
+	// request never trips, so this is the only bound on contact-list growth from a
+	// leaked workspace secret. Generous because exceeding it only drops the
+	// identity for that beat: the SDK beats again in 10-30s, so a legitimate burst
+	// drains over the following minutes instead of being lost.
+	a.rateLimiter.SetPolicy("wa_identify:create", 300, 1*time.Minute)
 	a.rateLimiter.SetPolicy("inbound:ip", 240, 1*time.Minute)        // Public inbound replies by source IP (generous; providers share IPs)
 	a.rateLimiter.SetPolicy("inbound:workspace", 120, 1*time.Minute) // Public inbound replies by workspace
 	// OIDC policies are registered UNCONDITIONALLY (even when OIDC is disabled):
@@ -532,7 +555,6 @@ func (a *App) InitServices() error {
 		SMTPBridgePort:          smtpBridgePort,
 		SMTPBridgeTLSCertBase64: smtpBridgeTLSCertBase64,
 		SMTPBridgeTLSKeyBase64:  smtpBridgeTLSKeyBase64,
-		SMTPBridgeTLSMode:       a.config.EnvValues.SMTPBridgeTLSMode,
 
 		OIDCEnabled:         a.config.EnvValues.OIDCEnabled,
 		OIDCIssuerURL:       a.config.EnvValues.OIDCIssuerURL,
@@ -557,8 +579,11 @@ func (a *App) InitServices() error {
 
 	// OIDC service (second session-minter alongside magic-code). Always constructed;
 	// IsEnabled() gates everything, and provider init is lazy + self-healing, so this
-	// is cheap even when OIDC is disabled. The exchange-code store is process-local
-	// (single-instance; multi-replica needs sticky sessions — see plan §6.D).
+	// is cheap even when OIDC is disabled. The exchange-code store is process-local:
+	// a code minted on one replica cannot be redeemed on another, so multi-replica
+	// deployments need sticky sessions until a DB-backed store replaces it.
+	// The argument is the background CLEANUP interval, not the code lifetime — each
+	// entry carries its own TTL from oidcExchangeTTL at Set time.
 	a.oidcExchangeCache = cache.NewInMemoryCache(30 * time.Second)
 	a.oidcService = service.NewOIDCService(service.OIDCServiceConfig{
 		UserRepo:              a.userRepo,
@@ -574,7 +599,7 @@ func (a *App) InitServices() error {
 		// the root-account privilege-escalation guard in resolveOrProvisionUser.
 		IsRootEmail:  a.config.IsRootEmailInsensitive,
 		IsProduction: a.config.IsProduction(),
-		Logger:                a.logger,
+		Logger:       a.logger,
 	})
 
 	// Initialize template service
@@ -602,6 +627,11 @@ func (a *App) InitServices() error {
 		a.inboundWebhookEventRepo,
 		a.contactListRepo,
 		a.contactTimelineRepo,
+		a.webAnalyticsRepo,
+		a.emailQueueRepo,
+		a.customEventRepo,
+		a.segmentRepo,
+		a.contactSegmentQueueRepo,
 		a.logger,
 	)
 
@@ -623,6 +653,18 @@ func (a *App) InitServices() error {
 		a.authService,
 		a.logger,
 	)
+
+	// Initialize annotation service
+	a.annotationService = service.NewAnnotationService(
+		a.annotationRepo,
+		a.workspaceRepo,
+		a.authService,
+		a.logger,
+	)
+	// Subscribe here rather than later: without this the broadcast orchestrator
+	// publishes its sending-started event into the void and no broadcast is ever
+	// annotated, with nothing else in the system noticing.
+	a.annotationService.RegisterWithEventBus(a.eventBus)
 
 	// Initialize http client
 	httpClient := &http.Client{
@@ -831,6 +873,7 @@ func (a *App) InitServices() error {
 		a.segmentRepo,
 		a.workspaceRepo,
 		a.taskService,
+		a.authService,
 		a.logger,
 	)
 
@@ -906,14 +949,35 @@ func (a *App) InitServices() error {
 
 	// Initialize integration sync processor for recurring integration sync tasks
 	integrationSyncProcessor := service.NewIntegrationSyncProcessor(a.logger)
-	// TODO: Register integration-specific handlers here as integrations are added
-	// Example: integrationSyncProcessor.RegisterHandler("staminads", staminadsHandler)
+	// No handlers are registered yet, so this processor is dormant: the recurring
+	// machinery (backoff, consecutive-error accounting, reset/trigger) is built and
+	// tested, but nothing first-party drives it and only the task API can create a
+	// recurring task. Register handlers here as pull-based integrations are added
+	// — integrationSyncProcessor.RegisterHandler("<type>", handler).
 	a.taskService.RegisterProcessor(integrationSyncProcessor)
+
+	// Attribution backfill for web analytics (rewrites historical rows after
+	// rule changes).
+	a.taskService.RegisterProcessor(service.NewWebAnalyticsBackfillProcessor(
+		a.workspaceRepo,
+		a.webAnalyticsRepo,
+		a.taskRepo,
+		a.logger,
+	))
 
 	// Initialize webhook subscription service (before demo service so it can create subscriptions)
 	a.webhookSubscriptionService = service.NewWebhookSubscriptionService(
 		a.webhookSubscriptionRepo,
 		a.webhookDeliveryRepo,
+		a.authService,
+		a.logger,
+	)
+
+	// Initialize automation service. It is built here, ahead of the demo service, because the demo
+	// seeder creates its showcase automations through it — the same validated path a user's own
+	// automations take.
+	a.automationService = service.NewAutomationService(
+		a.automationRepo,
 		a.authService,
 		a.logger,
 	)
@@ -943,7 +1007,10 @@ func (a *App) InitServices() error {
 		a.inboundWebhookEventRepo,
 		a.broadcastRepo,
 		a.customEventRepo,
+		a.webAnalyticsRepo,
+		a.annotationRepo,
 		a.webhookSubscriptionService,
+		a.automationService,
 	)
 
 	// Initialize telemetry service
@@ -975,6 +1042,60 @@ func (a *App) InitServices() error {
 		a.config.TaskScheduler.MaxTasks,
 	)
 
+	// Initialize web analytics ingestion (buffer + service). The GeoIP
+	// database is optional: a missing or unreadable file degrades to empty
+	// geo dimensions rather than blocking startup. With no GEOIP_DB_PATH set,
+	// the database shipped with Notifuse is picked up automatically.
+	geoPath := geoip.ResolvePath(a.config.GeoIPDBPath)
+	geoResolver, geoErr := geoip.New(geoPath)
+	if geoErr != nil {
+		a.logger.WithField("error", geoErr.Error()).WithField("path", geoPath).
+			Error("Failed to open GeoIP database; web analytics will run without geo enrichment")
+		geoResolver, _ = geoip.New("")
+	} else if geoResolver.Enabled() {
+		a.logger.WithField("path", geoPath).Info("GeoIP database loaded")
+	}
+	a.webAnalyticsBuffer = service.NewWebAnalyticsBuffer(a.webAnalyticsRepo, a.logger, service.DefaultWebAnalyticsBufferConfig())
+
+	// The bridge hangs off the BUFFER, never off the repository: the demo data
+	// generator calls FlushBatch directly, and hooking there would bridge its
+	// whole synthetic history in one shot, on a path with no say in it. The demo
+	// does record its own conversions on the timeline, but explicitly and on its
+	// own terms — it shares the payload builder rather than the trigger, so it
+	// chooses what to write and the bridge's staleness guard keeps protecting the
+	// public ingest path (see seedDemoWebGoalEvents).
+	a.webAnalyticsBuffer.SetContactBridge(service.NewWebAnalyticsContactBridge(
+		a.contactRepo,
+		a.customEventRepo,
+		a.logger,
+	))
+	a.webAnalyticsService = service.NewWebAnalyticsService(
+		a.workspaceRepo,
+		a.contactRepo,
+		a.webAnalyticsBuffer,
+		geoResolver,
+		a.authService,
+		a.taskRepo,
+		a.rateLimiter,
+		a.logger,
+	)
+
+	// Partition maintenance for the web analytics tables (daily). The same pass
+	// refreshes each workspace's monthly usage snapshot.
+	a.webAnalyticsMaintenanceWorker = service.NewWebAnalyticsMaintenanceWorker(
+		a.workspaceRepo,
+		a.webAnalyticsRepo,
+		a.logger,
+	)
+
+	// Sums those snapshots across workspaces for the signed usage read. Reads
+	// only — the recount belongs to the worker above.
+	a.usageService = service.NewUsageService(
+		a.workspaceRepo,
+		a.webAnalyticsRepo,
+		a.logger,
+	)
+
 	// Initialize webhook delivery worker
 	a.webhookDeliveryWorker = service.NewWebhookDeliveryWorker(
 		a.webhookSubscriptionRepo,
@@ -996,13 +1117,6 @@ func (a *App) InitServices() error {
 	)
 	// Enable the stop-on-reply just-in-time guard for automation sends.
 	a.emailQueueWorker.SetAutomationRepo(a.automationRepo)
-
-	// Initialize automation service
-	a.automationService = service.NewAutomationService(
-		a.automationRepo,
-		a.authService,
-		a.logger,
-	)
 
 	// Initialize Firecrawl service
 	firecrawlService := service.NewFirecrawlService(a.logger)
@@ -1027,7 +1141,6 @@ func (a *App) InitServices() error {
 		a.listRepo,
 		a.templateRepo,
 		a.emailQueueRepo,
-		a.messageHistoryRepo,
 		a.contactTimelineRepo,
 		a.logger,
 		a.config.APIEndpoint,
@@ -1167,7 +1280,7 @@ func (a *App) InitHandlers() error {
 		getJWTSecret,
 		a.logger,
 		a.config.Security.SecretKey,
-	)
+	).WithWebAnalyticsCacheInvalidator(a.webAnalyticsService.InvalidateWorkspaceCache)
 	contactHandler := httpHandler.NewContactHandler(a.contactService, getJWTSecret, a.logger)
 	listHandler := httpHandler.NewListHandler(a.listService, getJWTSecret, a.logger)
 	contactListHandler := httpHandler.NewContactListHandler(a.contactListService, getJWTSecret, a.logger)
@@ -1205,6 +1318,17 @@ func (a *App) InitHandlers() error {
 		getJWTSecret,
 		a.logger,
 	)
+	webAnalyticsHandler := httpHandler.NewWebAnalyticsHandler(
+		a.webAnalyticsService,
+		getJWTSecret,
+		a.logger,
+		webanalyticssdk.JS,
+	)
+	usageHandler := httpHandler.NewUsageHandler(
+		a.usageService,
+		a.config.Security.SecretKey,
+		a.logger,
+	)
 	contactTimelineHandler := httpHandler.NewContactTimelineHandler(
 		a.contactTimelineService,
 		a.authService,
@@ -1220,6 +1344,12 @@ func (a *App) InitHandlers() error {
 		a.customEventService,
 		getJWTSecret,
 		a.logger,
+	)
+	annotationHandler := httpHandler.NewAnnotationHandler(
+		a.annotationService,
+		getJWTSecret,
+		a.logger,
+		a.config.IsDemo(),
 	)
 	webhookSubscriptionHandler := httpHandler.NewWebhookSubscriptionHandler(
 		a.webhookSubscriptionService,
@@ -1267,9 +1397,12 @@ func (a *App) InitHandlers() error {
 	messageHistoryHandler.RegisterRoutes(a.mux)
 	notificationCenterHandler.RegisterRoutes(a.mux)
 	analyticsHandler.RegisterRoutes(a.mux)
+	webAnalyticsHandler.RegisterRoutes(a.mux)
+	usageHandler.RegisterRoutes(a.mux)
 	contactTimelineHandler.RegisterRoutes(a.mux)
 	segmentHandler.RegisterRoutes(a.mux)
 	customEventHandler.RegisterRoutes(a.mux)
+	annotationHandler.RegisterRoutes(a.mux)
 	webhookSubscriptionHandler.RegisterRoutes(a.mux)
 	automationHandler.RegisterRoutes(a.mux)
 	llmHandler.RegisterRoutes(a.mux)
@@ -1321,6 +1454,20 @@ func (a *App) Start() error {
 
 	// Signal that the server has been created and is about to start
 	close(serverStarted)
+
+	// Start the web analytics buffer immediately (no warm-up delay): /track
+	// accepts beats from the first request, and unflushed beats are the only
+	// state that would be lost on a crash.
+	if a.webAnalyticsBuffer != nil {
+		go a.webAnalyticsBuffer.Start(a.GetShutdownContext())
+	}
+
+	// Partition maintenance runs in demo mode too: it only touches the
+	// workspace databases (no external side effects) and its own initial
+	// delay keeps it away from the boot path.
+	if a.webAnalyticsMaintenanceWorker != nil {
+		go a.webAnalyticsMaintenanceWorker.Start(a.GetShutdownContext())
+	}
 
 	// Start internal task scheduler if enabled (with 30 second delay)
 	if a.config.TaskScheduler.Enabled && a.taskScheduler != nil {
@@ -1466,6 +1613,13 @@ func (a *App) Shutdown(ctx context.Context) error {
 
 	if a.oidcExchangeCache != nil {
 		a.oidcExchangeCache.Stop()
+	}
+
+	// Drain the web analytics buffer before connections start closing; Stop
+	// is synchronous and idempotent (Start's own shutdown path also flushes).
+	if a.webAnalyticsBuffer != nil {
+		a.logger.Info("Flushing web analytics buffer...")
+		a.webAnalyticsBuffer.Stop()
 	}
 
 	// Stop task scheduler first (before stopping server)
@@ -1687,9 +1841,27 @@ func (a *App) WaitForServerStart(ctx context.Context) bool {
 	}
 }
 
+// formatPlanLimit renders a plan limit for the startup log, where 0 = unlimited
+func formatPlanLimit(value int) string {
+	if value == 0 {
+		return "unlimited"
+	}
+	return fmt.Sprintf("%d", value)
+}
+
 // Initialize sets up all components of the application
 func (a *App) Initialize() error {
 	a.logger.WithField("version", a.config.Version).Info("Starting Notifuse application")
+
+	// Plan limits arrive as environment variables. Logging the resolved values is
+	// the only way to confirm that a redeploy actually delivered a quota change.
+	a.logger.WithFields(map[string]interface{}{
+		"max_active_contacts":   formatPlanLimit(a.config.Plan.MaxActiveContacts),
+		"max_stored_contacts":   formatPlanLimit(a.config.Plan.MaxStoredContacts),
+		"max_monthly_events":    formatPlanLimit(a.config.Plan.MaxMonthlyEvents),
+		"max_monthly_pageviews": formatPlanLimit(a.config.Plan.MaxMonthlyPageviews),
+		"data_retention_months": formatPlanLimit(a.config.Plan.DataRetentionMonths),
+	}).Info("Plan limits resolved")
 
 	if err := a.InitTracing(); err != nil {
 		return err
@@ -1784,6 +1956,16 @@ func (a *App) GetContactRepository() domain.ContactRepository {
 	return a.contactRepo
 }
 
+// GetWebAnalyticsRepository exposes the repository for tests that need to assert
+// on the analytics tables directly.
+func (a *App) GetWebAnalyticsRepository() domain.WebAnalyticsRepository {
+	return a.webAnalyticsRepo
+}
+
+func (a *App) GetCustomEventRepository() domain.CustomEventRepository {
+	return a.customEventRepo
+}
+
 func (a *App) GetListRepository() domain.ListRepository {
 	return a.listRepo
 }
@@ -1842,6 +2024,12 @@ func (a *App) GetAutomationScheduler() *service.AutomationScheduler {
 // delayed-start goroutine.
 func (a *App) GetTaskScheduler() *service.TaskScheduler {
 	return a.taskScheduler
+}
+
+// GetWebAnalyticsBuffer exposes the ingest buffer (integration tests flush it
+// deterministically instead of waiting for the ticker).
+func (a *App) GetWebAnalyticsBuffer() *service.WebAnalyticsBuffer {
+	return a.webAnalyticsBuffer
 }
 
 // SetHandler allows setting a custom HTTP handler

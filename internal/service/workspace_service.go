@@ -174,6 +174,7 @@ func (s *WorkspaceService) CreateWorkspace(ctx context.Context, id string, name 
 		randomSecretKey = "secret_key_for_dev_env"
 	}
 
+	webAnalyticsDefaults := domain.DefaultWebFilters()
 	workspace := &domain.Workspace{
 		ID:   id,
 		Name: name,
@@ -187,6 +188,16 @@ func (s *WorkspaceService) CreateWorkspace(ctx context.Context, id string, name 
 			EmailTrackingEnabled: true,
 			DefaultLanguage:      defaultLanguage,
 			Languages:            languages,
+			WebAnalytics: &domain.WebAnalyticsSettings{
+				Enabled:                false,
+				BounceThresholdSeconds: domain.WebAnalyticsDefaultBounceThresholdSeconds,
+				Filters:                webAnalyticsDefaults,
+				FiltersVersion:         domain.ComputeWebFiltersVersion(webAnalyticsDefaults),
+				GeoEnabled:             true,
+				GeoStoreCity:           true,
+				GeoStoreRegion:         true,
+				GeoCoordsPrecision:     2,
+			},
 		},
 		CreatedAt: time.Now().UTC(),
 		UpdatedAt: time.Now().UTC(),
@@ -322,6 +333,12 @@ func (s *WorkspaceService) UpdateWorkspace(ctx context.Context, id string, name 
 		return nil, err
 	}
 
+	// This assignment list is an allowlist, and the omissions are deliberate. Blog
+	// and web analytics settings are absent because each has its own endpoint gated
+	// on that feature's write permission — see SetBlogSettings. Adding them back
+	// here would let an owner saving general settings silently overwrite config a
+	// delegated manager owns, since these forms resubmit the whole settings object.
+	// Any new feature-scoped settings block belongs in its own setter, not here.
 	existingWorkspace.Name = name
 	existingWorkspace.Settings.WebsiteURL = settings.WebsiteURL
 	existingWorkspace.Settings.LogoURL = settings.LogoURL
@@ -863,6 +880,12 @@ func (s *WorkspaceService) SetCustomFieldLabels(ctx context.Context, workspaceID
 // this is gated on the granular blog:write permission so a delegated blog manager
 // can manage blog config. It loads the workspace and mutates only the blog fields,
 // preserving all other settings.
+//
+// It lives on WorkspaceService rather than BlogService because blog settings are
+// fields of the WorkspaceSettings entity, and workspace-entity writes all go
+// through this service's repository. Moving it to BlogService for feature cohesion
+// would split those writes across two services; the permission gate is orthogonal
+// and works from either home.
 func (s *WorkspaceService) SetBlogSettings(ctx context.Context, workspaceID string, enabled bool, settings *domain.BlogSettings) error {
 	var userWorkspace *domain.UserWorkspace
 	var err error
@@ -899,6 +922,56 @@ func (s *WorkspaceService) SetBlogSettings(ctx context.Context, workspaceID stri
 
 	if err := s.repo.Update(ctx, existingWorkspace); err != nil {
 		s.logger.WithField("workspace_id", workspaceID).WithField("error", err.Error()).Error("Failed to update blog settings")
+		return err
+	}
+
+	return nil
+}
+
+// SetWebAnalyticsSettings replaces the workspace's web analytics settings.
+// Like blog settings, it is gated by the feature's own permission rather than
+// workspace:write, and it preserves every other workspace setting.
+func (s *WorkspaceService) SetWebAnalyticsSettings(ctx context.Context, workspaceID string, settings *domain.WebAnalyticsSettings) error {
+	var userWorkspace *domain.UserWorkspace
+	var err error
+	ctx, _, userWorkspace, err = s.authService.AuthenticateUserForWorkspace(ctx, workspaceID)
+	if err != nil {
+		return fmt.Errorf("failed to authenticate user: %w", err)
+	}
+
+	if !userWorkspace.HasPermission(domain.PermissionResourceWebAnalytics, domain.PermissionTypeWrite) {
+		return domain.NewPermissionError(
+			domain.PermissionResourceWebAnalytics,
+			domain.PermissionTypeWrite,
+			"Insufficient permissions: write access to web_analytics required",
+		)
+	}
+
+	if err := settings.ValidateForSave(); err != nil {
+		return err
+	}
+
+	// The filters version drives backfill staleness detection; never trust a
+	// client-supplied hash.
+	if settings != nil {
+		settings.FiltersVersion = domain.ComputeWebFiltersVersion(settings.Filters)
+	}
+
+	existingWorkspace, err := s.repo.GetByID(ctx, workspaceID)
+	if err != nil {
+		s.logger.WithField("workspace_id", workspaceID).WithField("error", err.Error()).Error("Failed to get existing workspace")
+		return err
+	}
+
+	// No contacts:write gate here any more. It used to guard the two settings
+	// that switched contact-timeline writing on; both are gone, because calling
+	// identify() is now the opt-in and that decision is made in the customer's
+	// own code with the workspace secret, not in this panel.
+
+	existingWorkspace.Settings.WebAnalytics = settings
+
+	if err := s.repo.Update(ctx, existingWorkspace); err != nil {
+		s.logger.WithField("workspace_id", workspaceID).WithField("error", err.Error()).Error("Failed to update web analytics settings")
 		return err
 	}
 
@@ -1398,6 +1471,111 @@ func (s *WorkspaceService) CreateIntegration(ctx context.Context, req domain.Cre
 // preserveDerivedSESFields copies server-owned SES state from the stored integration onto the
 // updated one. These fields are written by webhook registration and tenant provisioning, never by
 // a client, so a client's value (or absence of one) must not win.
+// hydrateEmailProviderCredentials fills blank credentials on a client-supplied
+// provider from the stored one.
+//
+// Sibling of preserveEmailProviderSecrets, and the difference is which form it
+// restores. That one runs on the SAVE path and restores the ciphertext, because
+// the value is on its way back to the database. This one runs on paths that
+// USE the provider immediately — testing an integration — where the provider
+// services sign with the plaintext, so the ciphertext would be no help.
+//
+// The stored provider comes from a workspace the repository loaded, so AfterLoad
+// has already decrypted it.
+//
+// Only a provider block the caller actually sent is touched, so switching kind
+// and testing before saving cannot borrow the previous provider's credential, and
+// a credential the caller typed always wins — otherwise a wrong new key would
+// appear to work.
+func hydrateEmailProviderCredentials(incoming *domain.EmailProvider, stored *domain.EmailProvider) {
+	if incoming == nil || stored == nil {
+		return
+	}
+	fill := func(target *string, value string) {
+		if *target == "" {
+			*target = value
+		}
+	}
+
+	if incoming.SES != nil && stored.SES != nil {
+		fill(&incoming.SES.SecretKey, stored.SES.SecretKey)
+	}
+	if incoming.SMTP != nil && stored.SMTP != nil {
+		fill(&incoming.SMTP.Password, stored.SMTP.Password)
+		fill(&incoming.SMTP.Username, stored.SMTP.Username)
+		fill(&incoming.SMTP.OAuth2ClientSecret, stored.SMTP.OAuth2ClientSecret)
+		fill(&incoming.SMTP.OAuth2RefreshToken, stored.SMTP.OAuth2RefreshToken)
+	}
+	if incoming.SparkPost != nil && stored.SparkPost != nil {
+		fill(&incoming.SparkPost.APIKey, stored.SparkPost.APIKey)
+	}
+	if incoming.Postmark != nil && stored.Postmark != nil {
+		fill(&incoming.Postmark.ServerToken, stored.Postmark.ServerToken)
+	}
+	if incoming.Mailgun != nil && stored.Mailgun != nil {
+		fill(&incoming.Mailgun.APIKey, stored.Mailgun.APIKey)
+	}
+	if incoming.Mailjet != nil && stored.Mailjet != nil {
+		fill(&incoming.Mailjet.APIKey, stored.Mailjet.APIKey)
+		fill(&incoming.Mailjet.SecretKey, stored.Mailjet.SecretKey)
+	}
+	if incoming.SendGrid != nil && stored.SendGrid != nil {
+		fill(&incoming.SendGrid.APIKey, stored.SendGrid.APIKey)
+	}
+}
+
+// preserveEmailProviderSecrets keeps a stored credential when the caller's payload
+// carries none for that provider.
+//
+// Workspaces do not serve decrypted credentials (domain.Workspace.Redact), so a
+// client cannot echo an integration's password back on save. Without this, the
+// wholesale `updatedIntegration.EmailProvider = req.Provider` below would wipe the
+// stored credential on any edit that does not mention it — changing a sender name
+// would silently break sending.
+//
+// Only a provider block the caller actually sent is touched, so switching kinds
+// cannot drag the previous provider's secret across. A caller that supplies either
+// a new plaintext value or its own ciphertext is rotating deliberately and wins.
+//
+// The Supabase and LLM branches of UpdateIntegration do the same.
+func preserveEmailProviderSecrets(updated *domain.Integration, existing *domain.Integration) {
+	if updated == nil || existing == nil {
+		return
+	}
+	keep := func(newPlain, newCipher *string, oldCipher string) {
+		if *newPlain == "" && *newCipher == "" {
+			*newCipher = oldCipher
+		}
+	}
+
+	u, e := &updated.EmailProvider, &existing.EmailProvider
+
+	if u.SES != nil && e.SES != nil {
+		keep(&u.SES.SecretKey, &u.SES.EncryptedSecretKey, e.SES.EncryptedSecretKey)
+	}
+	if u.SMTP != nil && e.SMTP != nil {
+		keep(&u.SMTP.Password, &u.SMTP.EncryptedPassword, e.SMTP.EncryptedPassword)
+		keep(&u.SMTP.OAuth2ClientSecret, &u.SMTP.EncryptedOAuth2ClientSecret, e.SMTP.EncryptedOAuth2ClientSecret)
+		keep(&u.SMTP.OAuth2RefreshToken, &u.SMTP.EncryptedOAuth2RefreshToken, e.SMTP.EncryptedOAuth2RefreshToken)
+	}
+	if u.SparkPost != nil && e.SparkPost != nil {
+		keep(&u.SparkPost.APIKey, &u.SparkPost.EncryptedAPIKey, e.SparkPost.EncryptedAPIKey)
+	}
+	if u.Postmark != nil && e.Postmark != nil {
+		keep(&u.Postmark.ServerToken, &u.Postmark.EncryptedServerToken, e.Postmark.EncryptedServerToken)
+	}
+	if u.Mailgun != nil && e.Mailgun != nil {
+		keep(&u.Mailgun.APIKey, &u.Mailgun.EncryptedAPIKey, e.Mailgun.EncryptedAPIKey)
+	}
+	if u.Mailjet != nil && e.Mailjet != nil {
+		keep(&u.Mailjet.APIKey, &u.Mailjet.EncryptedAPIKey, e.Mailjet.EncryptedAPIKey)
+		keep(&u.Mailjet.SecretKey, &u.Mailjet.EncryptedSecretKey, e.Mailjet.EncryptedSecretKey)
+	}
+	if u.SendGrid != nil && e.SendGrid != nil {
+		keep(&u.SendGrid.APIKey, &u.SendGrid.EncryptedAPIKey, e.SendGrid.EncryptedAPIKey)
+	}
+}
+
 func preserveDerivedSESFields(updated *domain.Integration, existing *domain.Integration) {
 	if existing == nil || existing.EmailProvider.SES == nil {
 		return
@@ -1455,6 +1633,7 @@ func (s *WorkspaceService) UpdateIntegration(ctx context.Context, req domain.Upd
 	switch existingIntegration.Type {
 	case domain.IntegrationTypeEmail:
 		updatedIntegration.EmailProvider = req.Provider
+		preserveEmailProviderSecrets(&updatedIntegration, existingIntegration)
 		// Derived state belongs to the server, not the client. Without this, any caller whose
 		// payload omits these fields — which is every API client that isn't our console —
 		// silently wipes them: the SES tenant and configuration set stop being sent, and
