@@ -14,7 +14,11 @@ import { WebAnalyticsSettings } from '../components/settings/WebAnalyticsSetting
 import { WebhooksSettings } from '../components/settings/WebhooksSettings'
 import { useAuth } from '../contexts/AuthContext'
 import { DeleteWorkspaceSection } from '../components/settings/DeleteWorkspace'
-import { SettingsSidebar, SettingsSection } from '../components/settings/SettingsSidebar'
+import {
+  SettingsSidebar,
+  SETTINGS_SECTIONS,
+  SettingsSection
+} from '../components/settings/SettingsSidebar'
 
 const { Sider, Content } = Layout
 
@@ -33,34 +37,20 @@ export function WorkspaceSettingsPage() {
   const { refreshWorkspaces, user, workspaces } = useAuth()
   const navigate = useNavigate()
 
-  // Valid settings sections
-  const validSections: SettingsSection[] = [
-    'team',
-    'integrations',
-    'webhooks',
-    'custom-fields',
-    'smtp-bridge',
-    'general',
-    'blog',
-    'web-analytics',
-    'danger-zone'
-  ]
-
   // Get active section from URL or default to 'team'
-  const activeSection: SettingsSection = validSections.includes(section as SettingsSection)
+  const activeSection: SettingsSection = SETTINGS_SECTIONS.includes(section as SettingsSection)
     ? (section as SettingsSection)
     : 'team'
 
   useEffect(() => {
     // Redirect to team section if invalid section is provided
-    if (!validSections.includes(section as SettingsSection)) {
+    if (!SETTINGS_SECTIONS.includes(section as SettingsSection)) {
       navigate({
         to: '/console/workspace/$workspaceId/settings/$section',
         params: { workspaceId, section: 'team' },
         replace: true
       })
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- validSections is static
   }, [section, workspaceId, navigate])
 
   useEffect(() => {

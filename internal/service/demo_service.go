@@ -325,13 +325,18 @@ func (s *DemoService) createDemoWebhookSubscription(ctx context.Context, workspa
 		ctx, workspaceID, name, url,
 		domain.WebhookEventTypes, // Subscribe to all event types
 		nil,
+		// User-created, and unfiltered on both lists and segments: the demo
+		// subscription exists to show the console what the full event surface
+		// looks like, so narrowing it would defeat the point.
+		domain.WebhookSubscriptionSourceUser, nil, nil,
 	)
 	if err != nil {
 		return err
 	}
 
+	disabled := false
 	if _, err := s.webhookSubscriptionService.Update(
-		ctx, workspaceID, subscription.ID, name, url, domain.WebhookEventTypes, nil, false,
+		ctx, workspaceID, subscription.ID, name, url, domain.WebhookEventTypes, nil, &disabled, nil, nil,
 	); err != nil {
 		if deleteErr := s.webhookSubscriptionService.Delete(ctx, workspaceID, subscription.ID); deleteErr != nil {
 			s.logger.WithField("workspace_id", workspaceID).
@@ -1536,7 +1541,6 @@ func (s *DemoService) createSampleBroadcasts(ctx context.Context, workspaceID st
 				AutoSendWinner:   false,
 				Variations:       variations,
 			},
-			TrackingEnabled: true,
 			UTMParameters: &domain.UTMParameters{
 				Source:   demoBroadcastUTMSource,
 				Medium:   "email",

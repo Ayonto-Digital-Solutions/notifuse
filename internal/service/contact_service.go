@@ -316,20 +316,39 @@ func (s *ContactService) BatchImportContacts(ctx context.Context, workspaceID st
 	var err error
 	ctx, _, userWorkspace, err := s.authService.AuthenticateUserForWorkspace(ctx, workspaceID)
 	if err != nil {
+		// Err as well as Error: the handler matches the typed error to pick a status
+		// code, and a revoked key, a non-member and an unknown workspace are all
+		// indistinguishable once flattened to prose. Setting only the string made
+		// every authentication failure answer with the handler's generic fallback
+		// status, so an integration whose key was revoked never saw the 401 that
+		// tells it to re-authenticate.
 		response.Error = fmt.Sprintf("failed to authenticate user: %v", err)
+		response.Err = err
 		return response
 	}
 
 	// Check permission for writing contacts
 	if !userWorkspace.HasPermission(domain.PermissionResourceContacts, domain.PermissionTypeWrite) {
-		response.Error = "Insufficient permissions: write access to contacts required"
+		permErr := domain.NewPermissionError(
+			domain.PermissionResourceContacts,
+			domain.PermissionTypeWrite,
+			"Insufficient permissions: write access to contacts required",
+		)
+		response.Error = permErr.Error()
+		response.Err = permErr
 		return response
 	}
 
 	// If listIDs are provided, also check permission for writing lists
 	if len(listIDs) > 0 {
 		if !userWorkspace.HasPermission(domain.PermissionResourceLists, domain.PermissionTypeWrite) {
-			response.Error = "Insufficient permissions: write access to lists required"
+			permErr := domain.NewPermissionError(
+				domain.PermissionResourceLists,
+				domain.PermissionTypeWrite,
+				"Insufficient permissions: write access to lists required",
+			)
+			response.Error = permErr.Error()
+			response.Err = permErr
 			return response
 		}
 	}
@@ -455,15 +474,25 @@ func (s *ContactService) UpsertContact(ctx context.Context, workspaceID string, 
 		if err != nil {
 			operation.Action = domain.UpsertContactOperationError
 			operation.Error = err.Error()
+			// See BatchImportContacts: the string alone cannot be matched by
+			// errors.Is/As, so the handler fell through to its catch-all status and
+			// reported a revoked key as a bad request.
+			operation.Err = err
 			s.logger.WithField("email", contact.Email).Error(fmt.Sprintf("Failed to authenticate user: %v", err))
 			return operation
 		}
 
 		// Check permission for writing contacts
 		if !userWorkspace.HasPermission(domain.PermissionResourceContacts, domain.PermissionTypeWrite) {
+			permErr := domain.NewPermissionError(
+				domain.PermissionResourceContacts,
+				domain.PermissionTypeWrite,
+				"Insufficient permissions: write access to contacts required",
+			)
 			operation.Action = domain.UpsertContactOperationError
-			operation.Error = "Insufficient permissions: write access to contacts required"
-			s.logger.WithField("email", contact.Email).Error("Insufficient permissions: write access to contacts required")
+			operation.Error = permErr.Error()
+			operation.Err = permErr
+			s.logger.WithField("email", contact.Email).Error(permErr.Error())
 			return operation
 		}
 	}
@@ -488,6 +517,19 @@ func (s *ContactService) UpsertContact(ctx context.Context, workspaceID string, 
 
 	if !isNew {
 		operation.Action = domain.UpsertContactOperationUpdate
+	}
+
+	// Read the row back so the caller learns what was actually stored. The
+	// repository merges an update field by field and the database fills in the
+	// timestamps, so the struct passed in describes the request, not the result.
+	// Best effort on purpose: the write is committed by now, and turning a failed
+	// read into an error would report a successful upsert as a failure and invite
+	// the caller to retry it.
+	stored, err := s.repo.GetContactByEmail(ctx, workspaceID, contact.Email)
+	if err != nil {
+		s.logger.WithField("email", contact.Email).Error(fmt.Sprintf("Failed to read back upserted contact: %v", err))
+	} else {
+		operation.Contact = stored
 	}
 
 	return operation
