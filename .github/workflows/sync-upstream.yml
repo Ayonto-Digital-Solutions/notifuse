@@ -66,8 +66,15 @@ jobs:
               exit 1
             fi
 
-            echo "$UNMERGED" | xargs git checkout --ours --
-            echo "$UNMERGED" | xargs git add --
+            # Nicht per Datei mit `git checkout --ours` aufloesen: bei einem
+            # modify/delete-Konflikt (Datei im Fork geloescht, von Upstream
+            # geaendert) fehlt im Index die "unsere" Stage, und der Checkout
+            # bricht mit "does not have our version" ab. Stattdessen das ganze
+            # Verzeichnis pauschal auf den Fork-Stand zurueckdrehen — genau das
+            # ist ohnehin das gewuenschte Ergebnis (siehe Kopf).
+            git rm -rfq --ignore-unmatch -- .github/workflows
+            git checkout "$BEFORE" -- .github/workflows
+            git add -A -- .github/workflows
             git commit --no-edit
           fi
 
