@@ -24,12 +24,13 @@ import {
 } from '@ant-design/icons'
 import { useLingui } from '@lingui/react/macro'
 import { settingsApi } from '../../services/api/settings'
+import { SsoLicenceNotice } from '../license/SsoLicenceNotice'
 import { parseRootEmails } from '../../services/api/auth'
 import type { SystemSettingsData } from '../../types/settings'
 
 const { Text, Title } = Typography
 
-export function SystemSettingsDrawer() {
+export function SystemSettingsDrawer({ workspaceId }: { workspaceId?: string } = {}) {
   const { t } = useLingui()
   const { message } = App.useApp()
   const [open, setOpen] = useState(false)
@@ -537,6 +538,7 @@ export function SystemSettingsDrawer() {
 
             {/* SSO (OIDC) */}
             <Title level={5}>{t`SSO (OpenID Connect)`}</Title>
+            <SsoLicenceNotice oidcEnabled={!!oidcEnabled} workspaceId={workspaceId} />
             <Row gutter={16}>
               <Col span={6}>
                 <Form.Item

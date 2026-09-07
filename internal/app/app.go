@@ -24,13 +24,13 @@ import (
 	"github.com/Notifuse/notifuse/internal/service/queue"
 	"github.com/Notifuse/notifuse/pkg/cache"
 	pkgDatabase "github.com/Notifuse/notifuse/pkg/database"
+	"github.com/Notifuse/notifuse/pkg/emailerror"
 	"github.com/Notifuse/notifuse/pkg/geoip"
 	"github.com/Notifuse/notifuse/pkg/logger"
 	"github.com/Notifuse/notifuse/pkg/mailer"
 	"github.com/Notifuse/notifuse/pkg/ratelimiter"
 	"github.com/Notifuse/notifuse/pkg/smtp_bridge"
 	"github.com/Notifuse/notifuse/pkg/tracing"
-	webanalyticssdk "github.com/Notifuse/notifuse/web_analytics_sdk"
 
 	"contrib.go.opencensus.io/integrations/ocsql"
 )
@@ -173,6 +173,7 @@ type App struct {
 	webAnalyticsBuffer               *service.WebAnalyticsBuffer
 	webAnalyticsMaintenanceWorker    *service.WebAnalyticsMaintenanceWorker
 	usageService                     *service.UsageService
+	licenseService                   *service.LicenseService
 	// providers
 	postmarkService     *service.PostmarkService
 	mailgunService      *service.MailgunService
@@ -187,8 +188,14 @@ type App struct {
 	oidcExchangeCache cache.Cache // One-time OIDC exchange codes (single-instance)
 
 	// HTTP handlers
-	mux    *http.ServeMux
-	server *http.Server
+	//
+	// settingsHandler is the only handler kept on the App. It owns /api/licence.set, the sole
+	// way a licence is installed, so "is it holding a licence service" is a question worth
+	// being able to ask after the fact — see app_license_wiring_test.go. Every other handler
+	// is a local in InitHandlers.
+	settingsHandler *httpHandler.SettingsHandler
+	mux             *http.ServeMux
+	server          *http.Server
 
 	// Rate limiter (global, namespace-based)
 	rateLimiter *ratelimiter.RateLimiter
@@ -436,7 +443,7 @@ func (a *App) InitRepositories() error {
 	a.transactionalNotificationRepo = repository.NewTransactionalNotificationRepository(a.workspaceRepo)
 	a.messageHistoryRepo = repository.NewMessageHistoryRepository(a.workspaceRepo)
 	a.inboundWebhookEventRepo = repository.NewInboundWebhookEventRepository(a.workspaceRepo)
-	a.telemetryRepo = repository.NewTelemetryRepository(a.workspaceRepo)
+	a.telemetryRepo = repository.NewTelemetryRepository(a.workspaceRepo, a.logger)
 	a.analyticsRepo = repository.NewAnalyticsRepository(a.workspaceRepo, a.logger, a.config.AnalyticsWorkMem)
 	a.webAnalyticsRepo = repository.NewWebAnalyticsRepository(a.workspaceRepo, a.logger)
 	a.contactTimelineRepo = repository.NewContactTimelineRepository(a.workspaceRepo)
@@ -468,6 +475,24 @@ func (a *App) InitRepositories() error {
 func (a *App) InitServices() error {
 	// Initialize event bus first
 	a.eventBus = domain.NewInMemoryEventBus()
+
+	// Licence entitlements, built before every other service so that any of them can be
+	// handed the provider. It reads its key from the settings repository (built in
+	// InitRepositories) or from NOTIFUSE_LICENSE_KEY, and every failure — no key, a key
+	// that does not verify, a database that is down — leaves the deployment on the free
+	// tier rather than failing this call.
+	//
+	// OIDCEnabled is the RESOLVED flag, which config/oidc.go decides env-wins-else-database.
+	// A deployment that switched SSO on from the console has no environment variable to read.
+	// Nothing gates on it — the SSO gate lives in OIDCService.IsEnabled — but the startup
+	// line has to be able to say "SSO is on and the licence does not cover it", which is the
+	// one licence state that is otherwise invisible.
+	a.licenseService = service.NewLicenseService(service.LicenseServiceConfig{
+		SettingRepo: a.settingRepo,
+		EnvKey:      a.config.LicenseKey,
+		OIDCEnabled: a.config.OIDC.Enabled,
+		Logger:      a.logger,
+	})
 
 	// Initialize auth service with JWT secret provider callback
 	// Secret is loaded on-demand, so this never fails
@@ -599,6 +624,11 @@ func (a *App) InitServices() error {
 		// the root-account privilege-escalation guard in resolveOrProvisionUser.
 		IsRootEmail:  a.config.IsRootEmailInsensitive,
 		IsProduction: a.config.IsProduction(),
+		// The SSO gate. IsEnabled() answers "switched on AND licensed for", which is what
+		// makes the sign-in button appear and disappear with the licence rather than with
+		// a restart. Leaving this field out compiles and passes every unit test while SSO
+		// runs unlicensed — app_license_wiring_test.go is what notices.
+		Entitlements: a.licenseService,
 		Logger:       a.logger,
 	})
 
@@ -609,6 +639,9 @@ func (a *App) InitServices() error {
 		a.authService,
 		a.logger,
 		a.config.APIEndpoint,
+		// G5, the template-translations gate. Required and positional; omitting it does not
+		// compile, and app_license_wiring_test.go catches a nil passed to satisfy it.
+		a.licenseService,
 	)
 
 	// Initialize template block service
@@ -683,7 +716,7 @@ func (a *App) InitServices() error {
 	a.mailjetService = service.NewMailjetService(httpClient, a.authService, a.logger)
 	a.sparkPostService = service.NewSparkPostService(httpClient, a.authService, a.logger)
 	a.sesService = service.NewSESService(a.authService, a.logger)
-	a.sesDiscoveryService = service.NewSESDiscoveryService(a.workspaceRepo, a.authService, a.sesService, a.logger)
+	a.sesDiscoveryService = service.NewSESDiscoveryService(a.workspaceRepo, a.authService, a.sesService, a.logger, a.licenseService)
 	a.sendGridService = service.NewSendGridService(httpClient, a.authService, a.logger)
 
 	// Initialize email service
@@ -851,7 +884,7 @@ func (a *App) InitServices() error {
 	a.broadcastService.SetTaskService(a.taskService)
 
 	// Initialize message history service
-	a.messageHistoryService = service.NewMessageHistoryService(a.messageHistoryRepo, a.workspaceRepo, a.logger, a.authService)
+	a.messageHistoryService = service.NewMessageHistoryService(a.messageHistoryRepo, a.workspaceRepo, a.logger, a.authService, a.emailQueueRepo)
 
 	// Initialize notification center service
 	a.notificationCenterService = service.NewNotificationCenterService(
@@ -913,6 +946,7 @@ func (a *App) InitServices() error {
 		a.supabaseService,
 		a.dnsVerificationService,
 		a.blogService,
+		a.licenseService,
 	)
 
 	// Initialize and register segment build processor
@@ -1018,6 +1052,10 @@ func (a *App) InitServices() error {
 	)
 
 	// Initialize telemetry service
+	// OIDCEnabled is the RESOLVED a.config.OIDC.Enabled, which config/oidc.go decides
+	// env-wins-else-database, and never a.config.EnvValues.OIDCEnabled: an installation that
+	// switched SSO on from the settings drawer has no environment variable to read, and it is
+	// exactly the installation this number is about.
 	telemetryConfig := service.TelemetryServiceConfig{
 		Enabled:       a.config.Telemetry,
 		APIEndpoint:   a.config.APIEndpoint,
@@ -1025,6 +1063,8 @@ func (a *App) InitServices() error {
 		TelemetryRepo: a.telemetryRepo,
 		Logger:        a.logger,
 		HTTPClient:    httpClient, // Reuse the HTTP client created above
+		OIDCEnabled:   a.config.OIDC.Enabled,
+		Entitlements:  a.licenseService,
 	}
 	a.telemetryService = service.NewTelemetryService(telemetryConfig)
 
@@ -1121,6 +1161,24 @@ func (a *App) InitServices() error {
 	)
 	// Enable the stop-on-reply just-in-time guard for automation sends.
 	a.emailQueueWorker.SetAutomationRepo(a.automationRepo)
+
+	// An open circuit means the provider is refusing everything, so stop the
+	// campaigns riding on it and tell their owners. Without this the breaker only
+	// throttles: it resets after each cooldown and lets five more real attempts
+	// through, quietly spending a campaign's retries until its recipients are lost.
+	a.emailQueueWorker.SetCircuitOpenCallback(func(workspaceID, integrationID string, lastErr *emailerror.ClassifiedError) {
+		reason := "provider errors"
+		if lastErr != nil && lastErr.Original != nil {
+			reason = lastErr.Original.Error()
+		}
+		if err := a.broadcastService.PauseForCircuitBreaker(context.Background(), workspaceID, integrationID, reason); err != nil {
+			a.logger.WithFields(map[string]interface{}{
+				"workspace_id":   workspaceID,
+				"integration_id": integrationID,
+				"error":          err.Error(),
+			}).Error("Failed to pause broadcasts after the provider circuit opened")
+		}
+	})
 
 	// Initialize Firecrawl service
 	firecrawlService := service.NewFirecrawlService(a.logger)
@@ -1236,6 +1294,7 @@ func (a *App) InitHandlers() error {
 	userHandler := httpHandler.NewUserHandler(
 		a.userService,
 		a.workspaceService,
+		a.licenseService,
 		a.config,
 		getJWTSecret,
 		a.logger)
@@ -1259,7 +1318,11 @@ func (a *App) InitHandlers() error {
 		a.workspaceRepo,
 		a.blogService,
 		a.blogCache,
-		a.config.OIDC.Enabled,
+		// The predicate, not the boot flag. OIDCService.IsEnabled answers "switched on AND
+		// licensed for", and handing config.js the same function /api/user.oidc.start
+		// consults is what keeps the button from outliving the licence that paid for it —
+		// or from staying hidden after a key was pasted, which needs no restart.
+		a.oidcService.IsEnabled,
 		a.config.OIDC.ButtonLabel,
 	)
 	setupHandler := httpHandler.NewSetupHandler(
@@ -1268,7 +1331,7 @@ func (a *App) InitHandlers() error {
 		a.logger,
 		a, // Pass app for shutdown capability
 	)
-	settingsHandler := httpHandler.NewSettingsHandler(
+	a.settingsHandler = httpHandler.NewSettingsHandler(
 		a.setupService,
 		a.settingService,
 		a.userService,
@@ -1277,6 +1340,7 @@ func (a *App) InitHandlers() error {
 		a.config.Security.SecretKey,
 		a.config.RootEmail,
 		a, // AppShutdowner
+		a.licenseService,
 	)
 	workspaceHandler := httpHandler.NewWorkspaceHandler(
 		a.workspaceService,
@@ -1333,7 +1397,7 @@ func (a *App) InitHandlers() error {
 		a.webAnalyticsService,
 		getJWTSecret,
 		a.logger,
-		webanalyticssdk.JS,
+		loadWebAnalyticsSDK(a.logger),
 	)
 	usageHandler := httpHandler.NewUsageHandler(
 		a.usageService,
@@ -1385,7 +1449,7 @@ func (a *App) InitHandlers() error {
 
 	// Register routes
 	setupHandler.RegisterRoutes(a.mux) // Setup handler first (should be accessible without auth)
-	settingsHandler.RegisterRoutes(a.mux)
+	a.settingsHandler.RegisterRoutes(a.mux)
 	userHandler.RegisterRoutes(a.mux)
 	oidcHandler.RegisterRoutes(a.mux)
 	workspaceHandler.RegisterRoutes(a.mux)

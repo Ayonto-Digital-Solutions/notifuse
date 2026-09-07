@@ -32,7 +32,10 @@ export function DashboardPage() {
         extra={
           isRootUser(user?.email) ? (
             <div style={{ display: 'flex', gap: '8px' }}>
-              <SystemSettingsDrawer />
+              {/* Root only, and no licence gate stands in front of it: system settings is
+                  where SSO is switched on and off, and it is where a deployment running SSO
+                  without a licence for it is told so. */}
+              <SystemSettingsDrawer workspaceId={workspaces[0]?.id} />
               <Button
                 type="primary"
                 ghost
