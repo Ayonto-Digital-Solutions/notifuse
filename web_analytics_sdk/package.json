@@ -1,6 +1,6 @@
 {
   "name": "@notifuse/web-analytics-sdk",
-  "version": "40.0.0",
+  "version": "41.0.0",
   "private": true,
   "type": "module",
   "description": "Ultra-reliable web analytics SDK for tracking TimeScore metrics with millisecond precision",
@@ -55,7 +55,7 @@
     "tsx": "^4.21.0",
     "typescript": "^5.3.3",
     "typescript-eslint": "^8.66.0",
-    "vitest": "^3.2.7"
+    "vitest": "^4.1.11"
   },
   "dependencies": {
     "ua-parser-js": "^2.0.0"
