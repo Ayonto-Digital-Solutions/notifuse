@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/Users/marcmirschel/Documents/GitHub/notifuse/.codex/hooks/go-format.sh'",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "'/Users/marcmirschel/Documents/GitHub/notifuse/.codex/hooks/ts-lint.sh'",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
