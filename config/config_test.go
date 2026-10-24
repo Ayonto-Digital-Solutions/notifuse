@@ -110,6 +110,46 @@ func TestLoad_DataFeedSSRFProtectionDefault(t *testing.T) {
 	})
 }
 
+func TestLoad_WebhookDeliverySSRFProtectionDefault(t *testing.T) {
+	// SECRET_KEY is required for the config to load successfully.
+	_ = os.Setenv("SECRET_KEY", "test-secret-key-1234567890123456")
+	defer func() { _ = os.Unsetenv("SECRET_KEY") }()
+
+	t.Run("defaults to off (SSRF protection enabled)", func(t *testing.T) {
+		_ = os.Unsetenv("WEBHOOK_DELIVERY_ALLOW_PRIVATE_HOSTS")
+
+		cfg, err := LoadWithOptions(LoadOptions{})
+		require.NoError(t, err)
+		// Secure by default: a missing/typo'd env key must NOT disable protection.
+		assert.False(t, cfg.Webhook.AllowPrivateDeliveryHosts,
+			"outgoing webhook delivery SSRF protection must be ON by default")
+	})
+
+	t.Run("opt-in via env var", func(t *testing.T) {
+		_ = os.Setenv("WEBHOOK_DELIVERY_ALLOW_PRIVATE_HOSTS", "true")
+		defer func() { _ = os.Unsetenv("WEBHOOK_DELIVERY_ALLOW_PRIVATE_HOSTS") }()
+
+		cfg, err := LoadWithOptions(LoadOptions{})
+		require.NoError(t, err)
+		assert.True(t, cfg.Webhook.AllowPrivateDeliveryHosts)
+	})
+
+	// The two opt-outs are separate controls. Relaxing data feeds must not
+	// quietly relax webhook delivery, or an operator who enabled one would be
+	// granting the other without ever naming it.
+	t.Run("independent of the data-feed opt-out", func(t *testing.T) {
+		_ = os.Setenv("BROADCAST_DATA_FEED_ALLOW_PRIVATE_HOSTS", "true")
+		_ = os.Unsetenv("WEBHOOK_DELIVERY_ALLOW_PRIVATE_HOSTS")
+		defer func() { _ = os.Unsetenv("BROADCAST_DATA_FEED_ALLOW_PRIVATE_HOSTS") }()
+
+		cfg, err := LoadWithOptions(LoadOptions{})
+		require.NoError(t, err)
+		assert.True(t, cfg.Broadcast.AllowPrivateDataFeedHosts)
+		assert.False(t, cfg.Webhook.AllowPrivateDeliveryHosts,
+			"enabling the data-feed opt-out must not enable the webhook one")
+	})
+}
+
 func TestInvalidKeysHandling(t *testing.T) {
 	t.Run("missing_secret_key", func(t *testing.T) {
 		// Clear any existing environment variables
@@ -186,7 +226,7 @@ func TestLoad(t *testing.T) {
 
 func TestDatabaseConnectionConfig_Defaults(t *testing.T) {
 	// Set minimal required env vars
-	_ = os.Setenv("SECRET_KEY", "test-secret-key-for-testing")
+	_ = os.Setenv("SECRET_KEY", "test-secret-key-long-enough-to-sign")
 	_ = os.Setenv("DB_PASSWORD", "testpass")
 	defer func() { _ = os.Unsetenv("SECRET_KEY") }()
 	defer func() { _ = os.Unsetenv("DB_PASSWORD") }()
@@ -203,7 +243,7 @@ func TestDatabaseConnectionConfig_Defaults(t *testing.T) {
 
 func TestDatabaseConnectionConfig_CustomValues(t *testing.T) {
 	// Set custom connection configuration
-	_ = os.Setenv("SECRET_KEY", "test-secret-key-for-testing")
+	_ = os.Setenv("SECRET_KEY", "test-secret-key-long-enough-to-sign")
 	_ = os.Setenv("DB_PASSWORD", "testpass")
 	_ = os.Setenv("DB_MAX_CONNECTIONS", "200")
 	_ = os.Setenv("DB_MAX_CONNECTIONS_PER_DB", "5")
@@ -229,7 +269,7 @@ func TestDatabaseConnectionConfig_CustomValues(t *testing.T) {
 
 func TestDatabaseConnectionConfig_ValidationMinimum(t *testing.T) {
 	// Test that MaxConnections below minimum fails
-	_ = os.Setenv("SECRET_KEY", "test-secret-key-for-testing")
+	_ = os.Setenv("SECRET_KEY", "test-secret-key-long-enough-to-sign")
 	_ = os.Setenv("DB_PASSWORD", "testpass")
 	_ = os.Setenv("DB_MAX_CONNECTIONS", "10") // Below minimum of 20
 
@@ -244,7 +284,7 @@ func TestDatabaseConnectionConfig_ValidationMinimum(t *testing.T) {
 
 func TestDatabaseConnectionConfig_ValidationMaximum(t *testing.T) {
 	// Test that MaxConnections above maximum fails
-	_ = os.Setenv("SECRET_KEY", "test-secret-key-for-testing")
+	_ = os.Setenv("SECRET_KEY", "test-secret-key-long-enough-to-sign")
 	_ = os.Setenv("DB_PASSWORD", "testpass")
 	_ = os.Setenv("DB_MAX_CONNECTIONS", "15000") // Above maximum of 10000
 
@@ -259,7 +299,7 @@ func TestDatabaseConnectionConfig_ValidationMaximum(t *testing.T) {
 
 func TestDatabaseConnectionConfig_ValidationPerDBMinimum(t *testing.T) {
 	// Test that MaxConnectionsPerDB below minimum fails
-	_ = os.Setenv("SECRET_KEY", "test-secret-key-for-testing")
+	_ = os.Setenv("SECRET_KEY", "test-secret-key-long-enough-to-sign")
 	_ = os.Setenv("DB_PASSWORD", "testpass")
 	_ = os.Setenv("DB_MAX_CONNECTIONS_PER_DB", "0") // Below minimum of 1
 
@@ -274,7 +314,7 @@ func TestDatabaseConnectionConfig_ValidationPerDBMinimum(t *testing.T) {
 
 func TestDatabaseConnectionConfig_ValidationPerDBMaximum(t *testing.T) {
 	// Test that MaxConnectionsPerDB above maximum fails
-	_ = os.Setenv("SECRET_KEY", "test-secret-key-for-testing")
+	_ = os.Setenv("SECRET_KEY", "test-secret-key-long-enough-to-sign")
 	_ = os.Setenv("DB_PASSWORD", "testpass")
 	_ = os.Setenv("DB_MAX_CONNECTIONS_PER_DB", "60") // Above maximum of 50
 
@@ -285,6 +325,72 @@ func TestDatabaseConnectionConfig_ValidationPerDBMaximum(t *testing.T) {
 	_, err := LoadWithOptions(LoadOptions{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "DB_MAX_CONNECTIONS_PER_DB cannot exceed 50")
+}
+
+func TestEmailQueueConfig(t *testing.T) {
+	setRequired := func(t *testing.T) {
+		t.Setenv("SECRET_KEY", "test-secret-key-long-enough-to-sign")
+		t.Setenv("DB_PASSWORD", "testpass")
+		// Empty counts as unset, so values exported in the runner's shell do not leak in.
+		t.Setenv("EMAIL_QUEUE_CONCURRENCY", "")
+		t.Setenv("EMAIL_QUEUE_SMTP_CONCURRENCY", "")
+	}
+
+	t.Run("defaults", func(t *testing.T) {
+		setRequired(t)
+
+		cfg, err := LoadWithOptions(LoadOptions{})
+		require.NoError(t, err)
+
+		assert.Equal(t, 10, cfg.EmailQueue.Concurrency)
+		assert.Equal(t, 1, cfg.EmailQueue.SMTPConcurrency)
+	})
+
+	t.Run("environment overrides", func(t *testing.T) {
+		setRequired(t)
+		t.Setenv("EMAIL_QUEUE_CONCURRENCY", "25")
+		t.Setenv("EMAIL_QUEUE_SMTP_CONCURRENCY", "4")
+
+		cfg, err := LoadWithOptions(LoadOptions{})
+		require.NoError(t, err)
+
+		assert.Equal(t, 25, cfg.EmailQueue.Concurrency)
+		assert.Equal(t, 4, cfg.EmailQueue.SMTPConcurrency)
+	})
+
+	for _, setting := range []struct {
+		name  string
+		field func(*Config) int
+	}{
+		{"EMAIL_QUEUE_CONCURRENCY", func(c *Config) int { return c.EmailQueue.Concurrency }},
+		{"EMAIL_QUEUE_SMTP_CONCURRENCY", func(c *Config) int { return c.EmailQueue.SMTPConcurrency }},
+	} {
+		name, field := setting.name, setting.field
+		for _, tc := range []struct {
+			value   string
+			want    int
+			wantErr string
+		}{
+			{value: "0", wantErr: name + " must be at least 1 (got 0)"},
+			{value: "1", want: 1},
+			{value: "50", want: 50},
+			{value: "51", wantErr: name + " cannot exceed 50 (got 51)"},
+		} {
+			t.Run(name+"="+tc.value, func(t *testing.T) {
+				setRequired(t)
+				t.Setenv(name, tc.value)
+
+				cfg, err := LoadWithOptions(LoadOptions{})
+				if tc.wantErr != "" {
+					require.Error(t, err)
+					assert.Contains(t, err.Error(), tc.wantErr)
+					return
+				}
+				require.NoError(t, err)
+				assert.Equal(t, tc.want, field(cfg))
+			})
+		}
+	}
 }
 
 func TestLoadWithOptions_PlanLimits(t *testing.T) {

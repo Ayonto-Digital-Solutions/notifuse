@@ -12,6 +12,7 @@ import (
 	"github.com/Notifuse/notifuse/internal/domain"
 	"github.com/Notifuse/notifuse/internal/service"
 	"github.com/Notifuse/notifuse/internal/service/queue"
+	pkgDatabase "github.com/Notifuse/notifuse/pkg/database"
 	"github.com/Notifuse/notifuse/pkg/logger"
 )
 
@@ -31,6 +32,10 @@ type ServerManager struct {
 	// variant so the suite stops at setup with the tag to add instead of running on
 	// the free tier and failing deep inside a workspace or SSO test on a 402.
 	licenseErr error
+
+	// pendingSecurity holds the keys SetSecretKey gave, until the next start: the running
+	// server reads its configuration on every request.
+	pendingSecurity *config.SecurityConfig
 }
 
 // AppInterface defines the interface for the App (to avoid circular imports)
@@ -66,6 +71,8 @@ type AppInterface interface {
 	GetAuthService() interface{} // Returns *service.AuthService but defined as interface{} to avoid import cycle
 	GetTransactionalNotificationService() domain.TransactionalNotificationService
 	GetEmailQueueWorker() *queue.EmailQueueWorker
+	// GetEmailService lets a test build a second queue worker on the same database.
+	GetEmailService() domain.EmailServiceInterface
 	GetAutomationScheduler() *service.AutomationScheduler
 	GetTaskScheduler() *service.TaskScheduler
 	GetWebAnalyticsBuffer() *service.WebAnalyticsBuffer
@@ -80,8 +87,12 @@ const TestSecretKey = "test-secret-key-for-integration-tests-only"
 
 // NewServerManager creates a new server manager for testing
 func NewServerManager(appFactory func(*config.Config) AppInterface, dbManager *DatabaseManager) *ServerManager {
-	// Create test JWT secret (32+ bytes for HS256)
-	jwtSecret := []byte("test-jwt-secret-key-for-integration-tests-only-32bytes")
+	// The keys an installation with SECRET_KEY=TestSecretKey runs with, the JWT secret
+	// included, so a token signed with any other key is refused as it would be there.
+	security, err := config.NewSecurityConfig(TestSecretKey, "SECRET_KEY")
+	if err != nil {
+		panic(fmt.Sprintf("TestSecretKey is refused: %v", err))
+	}
 
 	// The suite runs on an enterprise licence — see license.go for what it carries and
 	// why. A licence the binary does not trust is recorded and reported from Start.
@@ -100,10 +111,7 @@ func NewServerManager(appFactory func(*config.Config) AppInterface, dbManager *D
 			Port: 0, // Use random available port
 		},
 		Database: *dbManager.GetConfig(),
-		Security: config.SecurityConfig{
-			SecretKey: TestSecretKey,
-			JWTSecret: jwtSecret,
-		},
+		Security: security,
 		SMTP: config.SMTPConfig{
 			Host:      "localhost",
 			Port:      1025,
@@ -157,6 +165,14 @@ func NewServerManagerWithLiveScheduler(appFactory func(*config.Config) AppInterf
 	return sm
 }
 
+// initializeApp initializes the app with a connection manager of its own. The manager is
+// a process-wide singleton set up once: without a reset, every app after the first would
+// keep the closed system database of the first.
+func (sm *ServerManager) initializeApp() error {
+	pkgDatabase.ResetConnectionManager()
+	return sm.app.Initialize()
+}
+
 // Start starts the test server
 func (sm *ServerManager) Start() error {
 	if sm.isStarted {
@@ -165,9 +181,10 @@ func (sm *ServerManager) Start() error {
 	if sm.licenseErr != nil {
 		return sm.licenseErr
 	}
+	sm.applyPendingSecretKey()
 
 	// Initialize the app
-	if err := sm.app.Initialize(); err != nil {
+	if err := sm.initializeApp(); err != nil {
 		return fmt.Errorf("failed to initialize app: %w", err)
 	}
 
@@ -228,6 +245,7 @@ func (sm *ServerManager) StartLive(ctx context.Context) error {
 	if sm.licenseErr != nil {
 		return sm.licenseErr
 	}
+	sm.applyPendingSecretKey()
 
 	// 1. Bind the listener first to know the port.
 	listener, err := net.Listen("tcp", fmt.Sprintf("%s:0", sm.config.Server.Host))
@@ -244,7 +262,7 @@ func (sm *ServerManager) StartLive(ctx context.Context) error {
 	sm.config.APIEndpoint = sm.url
 
 	// 3. Initialize app (reads APIEndpoint during InitServices).
-	if err := sm.app.Initialize(); err != nil {
+	if err := sm.initializeApp(); err != nil {
 		_ = listener.Close()
 		return fmt.Errorf("failed to initialize app: %w", err)
 	}
@@ -311,6 +329,7 @@ func (sm *ServerManager) StartLiveDirect(ctx context.Context) error {
 	if sm.licenseErr != nil {
 		return sm.licenseErr
 	}
+	sm.applyPendingSecretKey()
 
 	listener, err := net.Listen("tcp", fmt.Sprintf("%s:0", sm.config.Server.Host))
 	if err != nil {
@@ -325,7 +344,7 @@ func (sm *ServerManager) StartLiveDirect(ctx context.Context) error {
 	sm.config.TaskScheduler.Enabled = true
 	sm.config.APIEndpoint = "http://127.0.0.1:1"
 
-	if err := sm.app.Initialize(); err != nil {
+	if err := sm.initializeApp(); err != nil {
 		_ = listener.Close()
 		return fmt.Errorf("failed to initialize app: %w", err)
 	}
@@ -464,6 +483,25 @@ func (sm *ServerManager) WaitForReady(timeout time.Duration) error {
 		return fmt.Errorf("server not started")
 	}
 	return sm.waitForReady(timeout)
+}
+
+// SetSecretKey gives the server the keys an installation reads from SECRET_KEY=raw,
+// from its next start. The data factory and the seeder keep encrypting with
+// TestSecretKey.
+func (sm *ServerManager) SetSecretKey(raw string) error {
+	security, err := config.NewSecurityConfig(raw, "SECRET_KEY")
+	if err != nil {
+		return err
+	}
+	sm.pendingSecurity = &security
+	return nil
+}
+
+func (sm *ServerManager) applyPendingSecretKey() {
+	if sm.pendingSecurity != nil {
+		sm.config.Security = *sm.pendingSecurity
+		sm.pendingSecurity = nil
+	}
 }
 
 // Restart stops and starts the server

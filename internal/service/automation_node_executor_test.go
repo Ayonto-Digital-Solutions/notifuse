@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 	"github.com/Notifuse/notifuse/internal/domain/mocks"
 	pkgmocks "github.com/Notifuse/notifuse/pkg/mocks"
 	"github.com/Notifuse/notifuse/pkg/notifuse_mjml"
+	"github.com/Notifuse/notifuse/pkg/safehttpclient"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1214,6 +1218,10 @@ func TestEmailNodeExecutor_Execute_GeneratesTemplateURLs(t *testing.T) {
 				"ListUnsubscribeURL should contain unsubscribe-oneclick path")
 			assert.Contains(t, entry.Payload.EmailOptions.ListUnsubscribeURL, "lids=list1",
 				"ListUnsubscribeURL should contain the list ID")
+			// The worker copies Payload.ListID into message_history.list_id, which the
+			// complaint/bounce trigger needs to record the status on the list.
+			assert.Equal(t, "list1", entry.Payload.ListID,
+				"automation entry must carry the automation's list")
 
 			return nil
 		})
@@ -1275,7 +1283,11 @@ func TestEmailNodeExecutor_Execute_NoListID_StillWorks(t *testing.T) {
 
 	mockEmailQueueRepo.EXPECT().
 		Enqueue(gomock.Any(), "ws1", gomock.Any()).
-		Return(nil)
+		DoAndReturn(func(ctx context.Context, workspaceID string, entries []*domain.EmailQueueEntry) error {
+			require.Len(t, entries, 1)
+			assert.Empty(t, entries[0].Payload.ListID, "an automation without a list sends for no list")
+			return nil
+		})
 
 	params := NodeExecutionParams{
 		WorkspaceID: "ws1",
@@ -1415,7 +1427,7 @@ func TestEmailNodeExecutor_Execute_MarketingEmail_UnsubscribedContact(t *testing
 	mockWorkspaceRepo.EXPECT().GetByID(gomock.Any(), "ws1").Return(workspace, nil)
 	mockTemplateRepo.EXPECT().GetTemplateByID(gomock.Any(), "ws1", "tpl123", int64(0)).Return(template, nil)
 	mockContactListRepo.EXPECT().
-		GetContactListByIDs(gomock.Any(), "ws1", "recipient@example.com", "list1").
+		GetContactListIncludingRemoved(gomock.Any(), "ws1", "recipient@example.com", "list1").
 		Return(&domain.ContactList{
 			Email:  "recipient@example.com",
 			ListID: "list1",
@@ -1465,7 +1477,7 @@ func TestEmailNodeExecutor_Execute_MarketingEmail_BouncedContact(t *testing.T) {
 	mockWorkspaceRepo.EXPECT().GetByID(gomock.Any(), "ws1").Return(workspace, nil)
 	mockTemplateRepo.EXPECT().GetTemplateByID(gomock.Any(), "ws1", "tpl123", int64(0)).Return(template, nil)
 	mockContactListRepo.EXPECT().
-		GetContactListByIDs(gomock.Any(), "ws1", "recipient@example.com", "list1").
+		GetContactListIncludingRemoved(gomock.Any(), "ws1", "recipient@example.com", "list1").
 		Return(&domain.ContactList{
 			Email:  "recipient@example.com",
 			ListID: "list1",
@@ -1512,7 +1524,7 @@ func TestEmailNodeExecutor_Execute_MarketingEmail_ComplainedContact(t *testing.T
 	mockWorkspaceRepo.EXPECT().GetByID(gomock.Any(), "ws1").Return(workspace, nil)
 	mockTemplateRepo.EXPECT().GetTemplateByID(gomock.Any(), "ws1", "tpl123", int64(0)).Return(template, nil)
 	mockContactListRepo.EXPECT().
-		GetContactListByIDs(gomock.Any(), "ws1", "recipient@example.com", "list1").
+		GetContactListIncludingRemoved(gomock.Any(), "ws1", "recipient@example.com", "list1").
 		Return(&domain.ContactList{
 			Email:  "recipient@example.com",
 			ListID: "list1",
@@ -1559,7 +1571,7 @@ func TestEmailNodeExecutor_Execute_MarketingEmail_ActiveContact(t *testing.T) {
 	mockWorkspaceRepo.EXPECT().GetByID(gomock.Any(), "ws1").Return(workspace, nil)
 	mockTemplateRepo.EXPECT().GetTemplateByID(gomock.Any(), "ws1", "tpl123", int64(0)).Return(template, nil)
 	mockContactListRepo.EXPECT().
-		GetContactListByIDs(gomock.Any(), "ws1", "recipient@example.com", "list1").
+		GetContactListIncludingRemoved(gomock.Any(), "ws1", "recipient@example.com", "list1").
 		Return(&domain.ContactList{
 			Email:  "recipient@example.com",
 			ListID: "list1",
@@ -1610,7 +1622,7 @@ func TestEmailNodeExecutor_Execute_MarketingEmail_ContactNotInList(t *testing.T)
 	mockWorkspaceRepo.EXPECT().GetByID(gomock.Any(), "ws1").Return(workspace, nil)
 	mockTemplateRepo.EXPECT().GetTemplateByID(gomock.Any(), "ws1", "tpl123", int64(0)).Return(template, nil)
 	mockContactListRepo.EXPECT().
-		GetContactListByIDs(gomock.Any(), "ws1", "recipient@example.com", "list1").
+		GetContactListIncludingRemoved(gomock.Any(), "ws1", "recipient@example.com", "list1").
 		Return(nil, &domain.ErrContactListNotFound{Message: "not found"})
 	mockListRepo.EXPECT().GetListByID(gomock.Any(), "ws1", "list1").
 		Return(&domain.List{ID: "list1", Name: "Test List"}, nil)
@@ -1635,6 +1647,91 @@ func TestEmailNodeExecutor_Execute_MarketingEmail_ContactNotInList(t *testing.T)
 	assert.Equal(t, "next_node", *result.NextNodeID)
 	assert.Equal(t, domain.ContactAutomationStatusActive, result.Status)
 	assert.Equal(t, true, result.Output["queued"])
+}
+
+// A contact removed from the automation's list is a non-member, and non-members receive
+// its emails by design. A removal ends membership, though, not the opt-out, bounce or
+// complaint recorded on the row: those still stop the email, as they do for a member.
+// GetContactListByIDs hides removed rows, so the gate must read the row itself.
+func TestEmailNodeExecutor_Execute_MarketingEmail_RemovedContact(t *testing.T) {
+	removedAt := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		status   domain.ContactListStatus
+		skipped  bool
+		category string
+	}{
+		{domain.ContactListStatusComplained, true, "marketing"},
+		{domain.ContactListStatusBounced, true, "marketing"},
+		{domain.ContactListStatusUnsubscribed, true, "marketing"},
+		{domain.ContactListStatusComplained, true, "blog"},
+		// Removed while subscribed: a non-member like any other
+		{domain.ContactListStatusActive, false, "marketing"},
+		{domain.ContactListStatusPending, false, "marketing"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.category+" email, removed "+string(tc.status)+" row", func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			mockEmailQueueRepo := mocks.NewMockEmailQueueRepository(ctrl)
+			mockTemplateRepo := mocks.NewMockTemplateRepository(ctrl)
+			mockWorkspaceRepo := mocks.NewMockWorkspaceRepository(ctrl)
+			mockListRepo := mocks.NewMockListRepository(ctrl)
+			mockContactListRepo := mocks.NewMockContactListRepository(ctrl)
+			mockLogger := setupMockLoggerForNodeExecutor(ctrl)
+
+			executor := NewEmailNodeExecutor(mockEmailQueueRepo, mockTemplateRepo, mockWorkspaceRepo, mockListRepo, mockContactListRepo, "https://api.example.com", mockLogger)
+
+			mockWorkspaceRepo.EXPECT().GetByID(gomock.Any(), "ws1").Return(createTestWorkspaceWithEmailProvider(), nil)
+			mockTemplateRepo.EXPECT().GetTemplateByID(gomock.Any(), "ws1", "tpl123", int64(0)).
+				Return(createTestTemplateWithCategory(tc.category), nil)
+			mockContactListRepo.EXPECT().
+				GetContactListIncludingRemoved(gomock.Any(), "ws1", "recipient@example.com", "list1").
+				Return(&domain.ContactList{
+					Email:     "recipient@example.com",
+					ListID:    "list1",
+					Status:    tc.status,
+					DeletedAt: &removedAt,
+				}, nil)
+			if !tc.skipped {
+				mockListRepo.EXPECT().GetListByID(gomock.Any(), "ws1", "list1").
+					Return(&domain.List{ID: "list1", Name: "Test List"}, nil)
+				mockEmailQueueRepo.EXPECT().Enqueue(gomock.Any(), "ws1", gomock.Any()).Return(nil)
+			}
+			// Otherwise no Enqueue expectation: gomock fails the test if the email is queued
+
+			params := NodeExecutionParams{
+				WorkspaceID: "ws1",
+				Node: &domain.AutomationNode{
+					ID:         "email_node1",
+					Type:       domain.NodeTypeEmail,
+					NextNodeID: strPtr("next_node"),
+					Config:     map[string]interface{}{"template_id": "tpl123"},
+				},
+				Contact:     &domain.ContactAutomation{ID: "ca1", ContactEmail: "recipient@example.com"},
+				ContactData: &domain.Contact{Email: "recipient@example.com"},
+				Automation:  &domain.Automation{ID: "auto1", Name: "Test Automation", ListID: "list1"},
+			}
+
+			result, err := executor.Execute(context.Background(), params)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			if tc.skipped {
+				assert.Nil(t, result.NextNodeID)
+				assert.Equal(t, domain.ContactAutomationStatusExited, result.Status)
+				require.NotNil(t, result.ExitReason)
+				assert.Equal(t, string(tc.status), *result.ExitReason)
+				assert.Equal(t, true, result.Output["skipped"])
+				assert.Equal(t, string(tc.status), result.Output["skip_reason"])
+			} else {
+				require.NotNil(t, result.NextNodeID)
+				assert.Equal(t, "next_node", *result.NextNodeID)
+				assert.Equal(t, domain.ContactAutomationStatusActive, result.Status)
+				assert.Equal(t, true, result.Output["queued"])
+			}
+		})
+	}
 }
 
 func TestEmailNodeExecutor_Execute_MarketingEmail_NoListID(t *testing.T) {
@@ -1784,7 +1881,7 @@ func TestEmailNodeExecutor_Execute_BlogEmail_UnsubscribedContact(t *testing.T) {
 	mockWorkspaceRepo.EXPECT().GetByID(gomock.Any(), "ws1").Return(workspace, nil)
 	mockTemplateRepo.EXPECT().GetTemplateByID(gomock.Any(), "ws1", "tpl123", int64(0)).Return(template, nil)
 	mockContactListRepo.EXPECT().
-		GetContactListByIDs(gomock.Any(), "ws1", "recipient@example.com", "list1").
+		GetContactListIncludingRemoved(gomock.Any(), "ws1", "recipient@example.com", "list1").
 		Return(&domain.ContactList{
 			Email:  "recipient@example.com",
 			ListID: "list1",
@@ -1831,7 +1928,7 @@ func TestEmailNodeExecutor_Execute_MarketingEmail_ContactListRepoError(t *testin
 	mockWorkspaceRepo.EXPECT().GetByID(gomock.Any(), "ws1").Return(workspace, nil)
 	mockTemplateRepo.EXPECT().GetTemplateByID(gomock.Any(), "ws1", "tpl123", int64(0)).Return(template, nil)
 	mockContactListRepo.EXPECT().
-		GetContactListByIDs(gomock.Any(), "ws1", "recipient@example.com", "list1").
+		GetContactListIncludingRemoved(gomock.Any(), "ws1", "recipient@example.com", "list1").
 		Return(nil, errors.New("database connection error"))
 
 	params := NodeExecutionParams{
@@ -3235,12 +3332,19 @@ func TestABTestNodeExecutor_Execute_DifferentNodeID(t *testing.T) {
 
 // WebhookNodeExecutor tests
 
+// permissiveWebhookClient is what WEBHOOK_DELIVERY_ALLOW_PRIVATE_HOSTS builds: no
+// address guard, so the executor can reach an httptest server on 127.0.0.1. The
+// tests that need the production guard construct safehttpclient.New() themselves.
+func permissiveWebhookClient() *http.Client {
+	return &http.Client{Timeout: 5 * time.Second}
+}
+
 func TestWebhookNodeExecutor_NodeType(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
 	mockLogger := setupMockLoggerForNodeExecutor(ctrl)
-	executor := NewWebhookNodeExecutor(mockLogger)
+	executor := NewWebhookNodeExecutor(mockLogger, permissiveWebhookClient())
 	assert.Equal(t, domain.NodeTypeWebhook, executor.NodeType())
 }
 
@@ -3359,7 +3463,7 @@ func TestWebhookNodeExecutor_Execute_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewWebhookNodeExecutor(mockLogger)
+	executor := NewWebhookNodeExecutor(mockLogger, permissiveWebhookClient())
 
 	params := NodeExecutionParams{
 		WorkspaceID: "ws1",
@@ -3411,7 +3515,7 @@ func TestWebhookNodeExecutor_Execute_WithSecret(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewWebhookNodeExecutor(mockLogger)
+	executor := NewWebhookNodeExecutor(mockLogger, permissiveWebhookClient())
 
 	secret := "my-secret-token"
 	params := NodeExecutionParams{
@@ -3457,7 +3561,7 @@ func TestWebhookNodeExecutor_Execute_4xxError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewWebhookNodeExecutor(mockLogger)
+	executor := NewWebhookNodeExecutor(mockLogger, permissiveWebhookClient())
 
 	params := NodeExecutionParams{
 		WorkspaceID: "ws1",
@@ -3501,7 +3605,7 @@ func TestWebhookNodeExecutor_Execute_5xxError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewWebhookNodeExecutor(mockLogger)
+	executor := NewWebhookNodeExecutor(mockLogger, permissiveWebhookClient())
 
 	params := NodeExecutionParams{
 		WorkspaceID: "ws1",
@@ -3545,7 +3649,7 @@ func TestWebhookNodeExecutor_Execute_NonJSONResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewWebhookNodeExecutor(mockLogger)
+	executor := NewWebhookNodeExecutor(mockLogger, permissiveWebhookClient())
 
 	params := NodeExecutionParams{
 		WorkspaceID: "ws1",
@@ -3584,7 +3688,7 @@ func TestWebhookNodeExecutor_Execute_InvalidConfig(t *testing.T) {
 	defer ctrl.Finish()
 
 	mockLogger := setupMockLoggerForNodeExecutor(ctrl)
-	executor := NewWebhookNodeExecutor(mockLogger)
+	executor := NewWebhookNodeExecutor(mockLogger, permissiveWebhookClient())
 
 	params := NodeExecutionParams{
 		WorkspaceID: "ws1",
@@ -3626,7 +3730,7 @@ func TestWebhookNodeExecutor_Execute_EmptyResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewWebhookNodeExecutor(mockLogger)
+	executor := NewWebhookNodeExecutor(mockLogger, permissiveWebhookClient())
 
 	params := NodeExecutionParams{
 		WorkspaceID: "ws1",
@@ -3756,6 +3860,165 @@ func enqueueAutomationEmail(t *testing.T, webAnalytics *domain.WebAnalyticsSetti
 	require.NotNil(t, result)
 
 	return queuedHTML
+}
+
+// webhookNodeTestParams is a webhook node with the given config, entered by one
+// contact of one automation.
+func webhookNodeTestParams(config map[string]interface{}) NodeExecutionParams {
+	return NodeExecutionParams{
+		WorkspaceID: "ws1",
+		Node: &domain.AutomationNode{
+			ID:         "webhook_node1",
+			Type:       domain.NodeTypeWebhook,
+			NextNodeID: strPtr("next_node"),
+			Config:     config,
+		},
+		Contact:     &domain.ContactAutomation{ID: "ca1", ContactEmail: "test@example.com"},
+		ContactData: &domain.Contact{Email: "test@example.com"},
+		Automation:  &domain.Automation{ID: "auto1", Name: "Test Automation"},
+	}
+}
+
+// recordingTransport answers every request itself, so a test sees exactly what
+// the executor sent without anything leaving the process.
+type recordingTransport struct {
+	requests []*http.Request
+}
+
+func (rt *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	rt.requests = append(rt.requests, req)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+		Request:    req,
+	}, nil
+}
+
+// publicFirstHop stands in for a public host: it answers the first hop itself
+// with a redirect into the private network, and hands every other hop to the
+// SSRF-safe transport, which is where the refusal has to happen.
+type publicFirstHop struct {
+	host     string
+	location string
+	next     http.RoundTripper
+}
+
+func (p *publicFirstHop) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Host == p.host {
+		return &http.Response{
+			StatusCode: http.StatusFound,
+			Header:     http.Header{"Location": {p.location}},
+			Body:       io.NopCloser(strings.NewReader("")),
+			Request:    req,
+		}, nil
+	}
+	return p.next.RoundTrip(req)
+}
+
+func TestWebhookNodeExecutor_Execute_SendsThroughTheInjectedClient(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	transport := &recordingTransport{}
+	executor := NewWebhookNodeExecutor(setupMockLoggerForNodeExecutor(ctrl), &http.Client{Transport: transport})
+
+	// .invalid never resolves (RFC 6761): an executor that built its own client
+	// instead of using this one fails here on DNS, without reaching any network.
+	result, err := executor.Execute(context.Background(), webhookNodeTestParams(map[string]interface{}{
+		"url":    "https://receiver.invalid/hook",
+		"secret": "s3cret",
+	}))
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	require.Len(t, transport.requests, 1)
+	sent := transport.requests[0]
+	assert.Equal(t, http.MethodPost, sent.Method)
+	assert.Equal(t, "https://receiver.invalid/hook", sent.URL.String())
+	assert.Equal(t, "Bearer s3cret", sent.Header.Get("Authorization"))
+	assert.Equal(t, "application/json", sent.Header.Get("Content-Type"))
+
+	assert.Equal(t, 200, result.Output["status_code"])
+	assert.Equal(t, map[string]interface{}{"ok": true}, result.Output["response"])
+}
+
+func TestWebhookNodeExecutor_Execute_RefusesAPrivateTarget(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	var hits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = w.Write([]byte(`{"secret":"SHOULD NEVER BE READ"}`))
+	}))
+	defer server.Close()
+
+	executor := NewWebhookNodeExecutor(setupMockLoggerForNodeExecutor(ctrl), safehttpclient.New())
+
+	result, err := executor.Execute(context.Background(), webhookNodeTestParams(map[string]interface{}{"url": server.URL}))
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.ErrorIs(t, err, safehttpclient.ErrPrivateIP)
+	assert.Contains(t, err.Error(), server.URL)
+	assert.Contains(t, err.Error(), "WEBHOOK_DELIVERY_ALLOW_PRIVATE_HOSTS", "the refusal must say how to opt out")
+	assert.Equal(t, int32(0), atomic.LoadInt32(&hits), "a refused target must never be contacted")
+}
+
+// The headline attack: a public URL answering 302 with the metadata endpoint.
+// The client downgrades the POST to a GET and follows, so the refusal has to
+// happen on the redirect hop, and the message must not blame the public URL
+// for resolving privately when it was the redirect that did.
+func TestWebhookNodeExecutor_Execute_RefusesARedirectIntoThePrivateNetwork(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	var hits int32
+	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = w.Write([]byte(`{"AccessKeyId":"SHOULD NEVER BE READ"}`))
+	}))
+	defer internal.Close()
+
+	safe := safehttpclient.New()
+	client := &http.Client{
+		Timeout:       safe.Timeout,
+		CheckRedirect: safe.CheckRedirect,
+		Transport: &publicFirstHop{
+			host:     "public.example",
+			location: internal.URL + "/latest/meta-data/iam/security-credentials/",
+			next:     safe.Transport,
+		},
+	}
+	executor := NewWebhookNodeExecutor(setupMockLoggerForNodeExecutor(ctrl), client)
+
+	// .example is reserved (RFC 2606): an executor that built its own client
+	// instead of using this one fails on DNS, which is not ErrPrivateIP.
+	result, err := executor.Execute(context.Background(), webhookNodeTestParams(map[string]interface{}{"url": "http://public.example/hook"}))
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.ErrorIs(t, err, safehttpclient.ErrPrivateIP)
+	assert.Contains(t, err.Error(), "or a redirect from it")
+	assert.Equal(t, int32(0), atomic.LoadInt32(&hits), "the redirect target must never be contacted")
+}
+
+func TestNewWebhookNodeExecutor_NilClientFailsClosed(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	var hits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	executor := NewWebhookNodeExecutor(setupMockLoggerForNodeExecutor(ctrl), nil)
+	assert.Equal(t, 30*time.Second, executor.httpClient.Timeout, "the node's timeout is unchanged")
+
+	_, err := executor.Execute(context.Background(), webhookNodeTestParams(map[string]interface{}{"url": server.URL}))
+	assert.ErrorIs(t, err, safehttpclient.ErrPrivateIP, "a caller that passes no client gets the guarded one")
+	assert.Equal(t, int32(0), atomic.LoadInt32(&hits))
 }
 
 // TestEmailNodeExecutor_Execute_WebIdentity covers the "identified with no code"

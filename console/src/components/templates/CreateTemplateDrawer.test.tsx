@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, type Mock } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { App as AntApp } from 'antd'
@@ -181,5 +181,131 @@ describe('CreateTemplateDrawer AI assistant context', () => {
         'marketing'
       )
     })
+  })
+})
+
+describe('CreateTemplateDrawer template ID and editor mode', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  async function typeTemplateId(id: string) {
+    renderDrawer(<CreateTemplateDrawer workspace={workspace} />)
+    await userEvent.click(screen.getByRole('button', { name: /Create Template/i }))
+    await userEvent.type(screen.getByPlaceholderText('i.e: welcome-email'), id)
+  }
+
+  // A deleted template keeps its id (sent messages render from it) and no list shows it,
+  // so "already exists" alone leaves the author hunting for a template they deleted.
+  it('says an id belongs to a deleted template', async () => {
+    ;(templatesApi.get as Mock).mockResolvedValue({
+      template: { ...makeTemplate(2), deleted_at: '2026-09-27T13:00:00Z' }
+    })
+
+    await typeTemplateId('tmpl1')
+
+    expect(
+      await screen.findByText("This ID belongs to a deleted template and can't be reused")
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Template ID already exists')).not.toBeInTheDocument()
+  })
+
+  it('keeps the plain message for an id taken by a live template', async () => {
+    ;(templatesApi.get as Mock).mockResolvedValue({ template: makeTemplate(2) })
+
+    await typeTemplateId('tmpl1')
+
+    expect(await screen.findByText('Template ID already exists')).toBeInTheDocument()
+    expect(
+      screen.queryByText("This ID belongs to a deleted template and can't be reused")
+    ).not.toBeInTheDocument()
+  })
+
+  it('accepts an id the server does not know', async () => {
+    ;(templatesApi.get as Mock).mockRejectedValue(new Error('Template not found'))
+
+    await typeTemplateId('fresh-id')
+
+    await waitFor(() => expect(templatesApi.get).toHaveBeenCalled())
+    expect(screen.queryByText('Template ID already exists')).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("This ID belongs to a deleted template and can't be reused")
+    ).not.toBeInTheDocument()
+  })
+
+  // The mode is locked once saved; the field's help says so, and how to switch anyway.
+  it('explains in the editor mode help that the mode is permanent', async () => {
+    renderDrawer(<CreateTemplateDrawer workspace={workspace} />)
+    await userEvent.click(screen.getByRole('button', { name: /Create Template/i }))
+
+    const label = screen.getByText('Editor mode').closest('label')
+    expect(label).not.toBeNull()
+    await userEvent.hover(within(label as HTMLElement).getByRole('img', { name: 'question-circle' }))
+
+    expect(
+      await screen.findByText(/The editor mode can't be changed after the template is created/)
+    ).toBeInTheDocument()
+  })
+})
+
+// Names may hold 255 characters and IDs 32 (issue #463): the fields say so as the author
+// types, and an ID filled in from a long name fits its limit instead of failing on save.
+describe('CreateTemplateDrawer name and ID length', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    // Every ID is free, so the uniqueness check never gets in the way.
+    ;(templatesApi.get as Mock).mockRejectedValue(new Error('Template not found'))
+  })
+
+  const idInput = () => screen.getByPlaceholderText('i.e: welcome-email') as HTMLInputElement
+  const nameInput = () => screen.getByPlaceholderText('i.e: Welcome Email') as HTMLInputElement
+
+  it('limits the name to 255 characters and the ID to 32', async () => {
+    renderDrawer(<CreateTemplateDrawer workspace={workspace} />)
+    await userEvent.click(screen.getByRole('button', { name: /Create Template/i }))
+
+    expect(nameInput()).toHaveAttribute('maxlength', '255')
+    expect(idInput()).toHaveAttribute('maxlength', '32')
+  })
+
+  it('cuts the ID filled in from a long name to 32 characters, without a trailing hyphen', async () => {
+    renderDrawer(<CreateTemplateDrawer workspace={workspace} />)
+    await userEvent.click(screen.getByRole('button', { name: /Create Template/i }))
+
+    // kebab-cased, its first 32 characters end on a hyphen
+    await userEvent.type(nameInput(), 'Welcome email for new customers in France')
+
+    expect(idInput().value).toBe('welcome-email-for-new-customers')
+  })
+
+  it('keeps the -copy suffix within 32 characters when duplicating a long-named template', async () => {
+    const source = { ...makeTemplate(1), name: 'Welcome email for new customers in France' }
+    renderDrawer(<CreateTemplateDrawer workspace={workspace} fromTemplate={source} />)
+    await userEvent.click(screen.getByRole('button', { name: /Clone Template/i }))
+
+    expect(idInput().value).toBe('welcome-email-for-new-custo-copy')
+  })
+
+  it('gives the ID "copy" to the duplicate of a template whose name has no letters or digits', async () => {
+    const source = { ...makeTemplate(1), name: '!!!' }
+    renderDrawer(<CreateTemplateDrawer workspace={workspace} fromTemplate={source} />)
+    await userEvent.click(screen.getByRole('button', { name: /Clone Template/i }))
+
+    expect(idInput().value).toBe('copy')
+  })
+
+  it('does not save a duplicate whose name, with " copy" added, exceeds 255 characters', async () => {
+    const source = { ...makeTemplate(1), name: 'a'.repeat(252) }
+    renderDrawer(<CreateTemplateDrawer workspace={workspace} fromTemplate={source} />)
+    await userEvent.click(screen.getByRole('button', { name: /Clone Template/i }))
+
+    expect(nameInput().value).toHaveLength(257)
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(
+      await screen.findByText('Template name must be at most 255 characters long')
+    ).toBeInTheDocument()
+    expect(templatesApi.create).not.toHaveBeenCalled()
   })
 })

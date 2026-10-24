@@ -14,6 +14,8 @@ import (
 
 	"github.com/Notifuse/notifuse/internal/domain"
 	"github.com/Notifuse/notifuse/internal/domain/mocks"
+	servicemocks "github.com/Notifuse/notifuse/internal/service/mocks"
+	"github.com/Notifuse/notifuse/pkg/logger"
 	pkgmocks "github.com/Notifuse/notifuse/pkg/mocks"
 	"github.com/Notifuse/notifuse/pkg/safehttpclient"
 	"github.com/golang/mock/gomock"
@@ -93,6 +95,8 @@ func TestProcessWebhook_Success(t *testing.T) {
 
 		// Expect message history to be updated with the bounce status - using batch method
 		messageHistoryRepo := mocks.NewMockMessageHistoryRepository(ctrl)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"message1"}).
+			Return(map[string]string{"message1": "test@example.com"}, nil)
 		messageHistoryRepo.EXPECT().SetStatusesIfNotSet(
 			gomock.Any(),
 			workspaceID,
@@ -166,6 +170,8 @@ func TestProcessWebhook_Success(t *testing.T) {
 
 		// Expect message history to be updated with the delivery status - using batch method
 		messageHistoryRepo := mocks.NewMockMessageHistoryRepository(ctrl)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"message1"}).
+			Return(map[string]string{"message1": "test@example.com"}, nil)
 		messageHistoryRepo.EXPECT().SetStatusesIfNotSet(
 			gomock.Any(),
 			workspaceID,
@@ -260,6 +266,8 @@ func TestProcessWebhook_Success(t *testing.T) {
 
 		// Create service
 		messageHistoryRepo := mocks.NewMockMessageHistoryRepository(ctrl)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"message1"}).
+			Return(map[string]string{"message1": "test@example.com"}, nil)
 		service := &InboundWebhookEventService{
 			repo:               repo,
 			authService:        authService,
@@ -333,8 +341,9 @@ func TestNewInboundWebhookEventService(t *testing.T) {
 	contactRepo := mocks.NewMockContactRepository(ctrl)
 	messageHistoryRepo := mocks.NewMockMessageHistoryRepository(ctrl)
 	automationRepo := mocks.NewMockAutomationRepository(ctrl)
+	unsubscriber := servicemocks.NewMockListUnsubscriber(ctrl)
 
-	service := NewInboundWebhookEventService(repo, authService, log, workspaceRepo, messageHistoryRepo, contactRepo, automationRepo)
+	service := NewInboundWebhookEventService(repo, authService, log, workspaceRepo, messageHistoryRepo, contactRepo, automationRepo, unsubscriber)
 
 	assert.NotNil(t, service)
 	assert.Equal(t, repo, service.repo)
@@ -343,6 +352,7 @@ func TestNewInboundWebhookEventService(t *testing.T) {
 	assert.Equal(t, workspaceRepo, service.workspaceRepo)
 	assert.Equal(t, messageHistoryRepo, service.messageHistoryRepo)
 	assert.Equal(t, contactRepo, service.contactRepo)
+	assert.Same(t, unsubscriber, service.listUnsubscriber)
 }
 
 func TestProcessSESWebhook(t *testing.T) {
@@ -690,6 +700,248 @@ func TestProcessSESWebhook(t *testing.T) {
 		assert.NotNil(t, events[0].MessageID)
 		assert.Equal(t, "tag-message-id", *events[0].MessageID) // Tags have priority
 	})
+
+	// A notification lists every recipient of the email it reports on, such as an address the
+	// email was copied to
+	t.Run("A notification listing several recipients gives one event per recipient", func(t *testing.T) {
+		for name, c := range map[string]struct {
+			message     string
+			diagnostics []string
+		}{
+			"bounce": {
+				message:     `{"eventType":"Bounce","bounce":{"bounceType":"Permanent","bounceSubType":"General","bouncedRecipients":[{"emailAddress":"copy@example.com","diagnosticCode":"550 copy"},{"emailAddress":"test@example.com","diagnosticCode":"550 test"}],"timestamp":"2023-01-01T12:00:00Z"},"mail":{"messageId":"provider-msg-id","tags":{"notifuse_message_id":["msg-1"]}}}`,
+				diagnostics: []string{"550 copy", "550 test"},
+			},
+			"complaint": {
+				message:     `{"eventType":"Complaint","complaint":{"complainedRecipients":[{"emailAddress":"copy@example.com"},{"emailAddress":"test@example.com"}],"timestamp":"2023-01-01T12:00:00Z","complaintFeedbackType":"abuse"},"mail":{"messageId":"provider-msg-id","tags":{"notifuse_message_id":["msg-1"]}}}`,
+				diagnostics: []string{"", ""},
+			},
+			"delivery": {
+				message:     `{"eventType":"Delivery","delivery":{"recipients":["copy@example.com","test@example.com"],"timestamp":"2023-01-01T12:00:00Z"},"mail":{"messageId":"provider-msg-id","tags":{"notifuse_message_id":["msg-1"]}}}`,
+				diagnostics: []string{"", ""},
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				rawPayload, err := json.Marshal(domain.SESWebhookPayload{Message: c.message})
+				require.NoError(t, err)
+
+				events, err := service.processSESWebhook(integrationID, rawPayload)
+
+				require.NoError(t, err)
+				require.Len(t, events, 2)
+				for i, email := range []string{"copy@example.com", "test@example.com"} {
+					assert.Equal(t, email, events[i].RecipientEmail)
+					require.NotNil(t, events[i].MessageID)
+					assert.Equal(t, "msg-1", *events[i].MessageID)
+					assert.Equal(t, c.diagnostics[i], events[i].BounceDiagnostic)
+				}
+				assert.NotEqual(t, events[0].ID, events[1].ID)
+			})
+		}
+	})
+
+	t.Run("A notification listing more recipients than an SES email can have gives events for the first 50", func(t *testing.T) {
+		recipients := make([]map[string]string, 0, 60)
+		for i := 0; i < 60; i++ {
+			recipients = append(recipients, map[string]string{"emailAddress": fmt.Sprintf("r%d@example.com", i)})
+		}
+		listed, err := json.Marshal(recipients)
+		require.NoError(t, err)
+		rawPayload, err := json.Marshal(domain.SESWebhookPayload{
+			Message: `{"eventType":"Complaint","complaint":{"complainedRecipients":` + string(listed) + `,"timestamp":"2023-01-01T12:00:00Z","complaintFeedbackType":"abuse"},"mail":{"messageId":"provider-msg-id","tags":{"notifuse_message_id":["msg-1"]}}}`,
+		})
+		require.NoError(t, err)
+
+		events, err := service.processSESWebhook(integrationID, rawPayload)
+
+		require.NoError(t, err)
+		require.Len(t, events, 50)
+		assert.Equal(t, "r0@example.com", events[0].RecipientEmail)
+		assert.Equal(t, "r49@example.com", events[49].RecipientEmail)
+		for _, event := range events {
+			assert.Equal(t, string(rawPayload), event.RawPayload)
+		}
+	})
+
+	// SES reports a bounced recipient as the DSN's Final-Recipient, which is the address a
+	// forward or an alias led to rather than the one the email was sent to
+	t.Run("A notification keeps the address SES reports, even for an email sent to one other address", func(t *testing.T) {
+		rawPayload, err := json.Marshal(domain.SESWebhookPayload{
+			Message: `{"eventType":"Bounce","bounce":{"bounceType":"Permanent","bounceSubType":"General","bouncedRecipients":[{"emailAddress":"forwarded@elsewhere.example","diagnosticCode":"550 forwarded"}],"timestamp":"2023-01-01T12:00:00Z"},"mail":{"messageId":"provider-msg-id","destination":["test@example.com"],"tags":{"notifuse_message_id":["msg-1"]}}}`,
+		})
+		require.NoError(t, err)
+
+		events, err := service.processSESWebhook(integrationID, rawPayload)
+
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		assert.Equal(t, "forwarded@elsewhere.example", events[0].RecipientEmail)
+		assert.Equal(t, "550 forwarded", events[0].BounceDiagnostic)
+	})
+
+	t.Run("A notification about an email sent to several addresses reporting a forwarded address keeps it", func(t *testing.T) {
+		rawPayload, err := json.Marshal(domain.SESWebhookPayload{
+			Message: `{"eventType":"Bounce","bounce":{"bounceType":"Permanent","bounceSubType":"General","bouncedRecipients":[{"emailAddress":"forwarded@elsewhere.example","diagnosticCode":"550"}],"timestamp":"2023-01-01T12:00:00Z"},"mail":{"messageId":"provider-msg-id","destination":["test@example.com","copy@example.com"],"tags":{"notifuse_message_id":["msg-1"]}}}`,
+		})
+		require.NoError(t, err)
+
+		events, err := service.processSESWebhook(integrationID, rawPayload)
+
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		assert.Equal(t, "forwarded@elsewhere.example", events[0].RecipientEmail)
+	})
+
+	t.Run("A notification listing an empty address gives no event for it", func(t *testing.T) {
+		rawPayload, err := json.Marshal(domain.SESWebhookPayload{
+			Message: `{"eventType":"Delivery","delivery":{"recipients":["","test@example.com"],"timestamp":"2023-01-01T12:00:00Z"},"mail":{"messageId":"provider-msg-id","tags":{"notifuse_message_id":["msg-1"]}}}`,
+		})
+		require.NoError(t, err)
+
+		events, err := service.processSESWebhook(integrationID, rawPayload)
+
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		assert.Equal(t, "test@example.com", events[0].RecipientEmail)
+	})
+
+	t.Run("A notification about an email sent to several addresses keeps the addresses SES reports", func(t *testing.T) {
+		rawPayload, err := json.Marshal(domain.SESWebhookPayload{
+			Message: `{"eventType":"Complaint","complaint":{"complainedRecipients":[{"emailAddress":"copy@example.com"}],"timestamp":"2023-01-01T12:00:00Z","complaintFeedbackType":"abuse"},"mail":{"messageId":"provider-msg-id","destination":["test@example.com","copy@example.com"],"tags":{"notifuse_message_id":["msg-1"]}}}`,
+		})
+		require.NoError(t, err)
+
+		events, err := service.processSESWebhook(integrationID, rawPayload)
+
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		assert.Equal(t, "copy@example.com", events[0].RecipientEmail)
+	})
+
+	t.Run("A notification listing no recipient gives no event", func(t *testing.T) {
+		rawPayload, err := json.Marshal(domain.SESWebhookPayload{
+			Message: `{"eventType":"Bounce","bounce":{"bounceType":"Permanent","bounceSubType":"General","bouncedRecipients":[],"timestamp":"2023-01-01T12:00:00Z"},"mail":{"messageId":"provider-msg-id","tags":{"notifuse_message_id":["msg-1"]}}}`,
+		})
+		require.NoError(t, err)
+
+		events, err := service.processSESWebhook(integrationID, rawPayload)
+
+		require.NoError(t, err)
+		assert.Empty(t, events)
+	})
+
+	t.Run("A notification listing the same recipient twice gives one event for it", func(t *testing.T) {
+		rawPayload, err := json.Marshal(domain.SESWebhookPayload{
+			Message: `{"eventType":"Bounce","bounce":{"bounceType":"Transient","bounceSubType":"MailboxFull","bouncedRecipients":[{"emailAddress":"test@example.com","diagnosticCode":"452 first"},{"emailAddress":"copy@example.com","diagnosticCode":"452 copy"},{"emailAddress":"Test@Example.com","diagnosticCode":"452 again"}],"timestamp":"2023-01-01T12:00:00Z"},"mail":{"messageId":"provider-msg-id","tags":{"notifuse_message_id":["msg-1"]}}}`,
+		})
+		require.NoError(t, err)
+
+		events, err := service.processSESWebhook(integrationID, rawPayload)
+
+		require.NoError(t, err)
+		require.Len(t, events, 2)
+		assert.Equal(t, "test@example.com", events[0].RecipientEmail)
+		assert.Equal(t, "452 first", events[0].BounceDiagnostic)
+		assert.Equal(t, "copy@example.com", events[1].RecipientEmail)
+	})
+}
+
+func TestSameAddress(t *testing.T) {
+	for _, c := range []struct {
+		name             string
+		stored, reported string
+		same             bool
+	}{
+		{"the same address", "jane@example.com", "jane@example.com", true},
+		{"another letter case", "Jane@Example.com", "jane@EXAMPLE.com", true},
+		{"an international domain reported in Punycode", "user@münchen.de", "user@xn--mnchen-3ya.de", true},
+		{"an international domain reported in Unicode", "user@xn--mnchen-3ya.de", "user@münchen.de", true},
+		{"an international domain in capitals reported in Punycode", "User@MÜNCHEN.de", "user@xn--mnchen-3ya.de", true},
+		{"a non-ASCII local part reported as SES is sent it", "jürgen@example.com", "=?UTF-8?b?asO8cmdlbg==?=@example.com", true},
+		{"a non-ASCII local part in capitals reported as SES is sent it", "Üser@münchen.de", "=?UTF-8?b?w5xzZXI=?=@xn--mnchen-3ya.de", true},
+		{"a non-ASCII local part in capitals reported in lowercase", "Üser@münchen.de", "üser@xn--mnchen-3ya.de", true},
+		{"a non-ASCII local part in capitals reported encoded in lowercase", "Üser@münchen.de", "=?UTF-8?B?w7xzZXI=?=@xn--mnchen-3ya.de", true},
+		{"another non-ASCII local part", "Üser@münchen.de", "=?UTF-8?b?w7Z0aGVy?=@xn--mnchen-3ya.de", false},
+		{"another domain", "user@münchen.de", "user@munchen.de", false},
+		{"another local part", "jane@example.com", "john@example.com", false},
+		{"no address", "jane@example.com", "", false},
+		{"no domain", "jane@example.com", "jane", false},
+		{"an international domain stored decomposed, reported composed", "user@mu\u0308nchen.de", "user@münchen.de", true},
+		{"an international domain stored decomposed, reported in Punycode", "user@mu\u0308nchen.de", "user@xn--mnchen-3ya.de", true},
+		{"an international domain stored decomposed, reported as SES is sent it", "user@mu\u0308nchen.de", "user@xn--munchen-gie.de", true},
+		{"a domain DNS refuses, in another case", "jane@My_Domain.com", "jane@my_domain.COM", true},
+		{"a non-ASCII local part encoded, on a domain DNS refuses", "jürgen@my_domain.com", "=?utf-8?q?j=C3=BCrgen?=@My_Domain.com", true},
+		{"another local part on a domain DNS refuses", "jürgen@my_domain.com", "=?utf-8?q?j=C3=BCrg?=@my_domain.com", false},
+		{"two domains DNS tells apart", "user@straße.de", "user@strasse.de", false},
+		{"reported as SparkPost's sandbox sends it", "Jane@Example.com", "jane@example.com.sink.sparkpostmail.com", true},
+		{"another address as SparkPost's sandbox sends it", "jane@example.com", "john@example.com.sink.sparkpostmail.com", false},
+		{"an international domain in Punycode as SparkPost's sandbox sends it", "user@münchen.de", "user@xn--mnchen-3ya.de.SINK.sparkpostmail.com", true},
+		{"a local part as SES is sent it, in another letter case, decodes to another", "jürgen@example.com", "=?UTF-8?b?AsO8cmdlbg==?=@example.com", false},
+		{"reported with spaces around it", "jane@example.com", " jane@example.com\u00a0", true},
+		{"a domain reported with a character DNS ignores", "user@example.com", "user@ex\u00adample.com", true},
+		{"a stored domain longer than DNS holds is not looked up", "user@" + strings.Repeat("\u00ad", 300) + "example.com", "user@example.com", false},
+		{"as many characters DNS ignores as room is left for", "user@example.com", "user@ex" + strings.Repeat("\u00ad", 8) + "ample.com", true},
+		{"one character DNS ignores more than room is left for: not looked up", "user@example.com", "user@ex" + strings.Repeat("\u00ad", 9) + "ample.com", false},
+		{"a local part encoded in two words", "jane@example.com", "=?utf-8?q?ja?= =?utf-8?q?ne?=@example.com", true},
+		{"an address longer than any spelling of one is not decoded", "jane@example.com", "=?utf-8?q?ja?=" + strings.Repeat(" ", 3000) + "=?utf-8?q?ne?=@example.com", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			assert.Equal(t, c.same, sameAddress(c.stored, c.reported))
+		})
+	}
+}
+
+// Encoding a domain to Punycode and decoding a crafted encoded local part take time growing
+// with the square of their length, so an event naming an address far longer than any
+// spelling of one must not hold up the request. The shorter bound on the domain alone is
+// pinned in TestSameAddress, "a stored domain longer than DNS holds is not looked up", and in
+// TestAddressForm_ADomainLongerThanDNSHoldsIsNotLookedUp.
+func TestSameAddress_ALongAddressIsComparedQuickly(t *testing.T) {
+	var label strings.Builder
+	for i := 0; i < 20000; i++ {
+		label.WriteRune(rune(0x4e00 + i))
+	}
+
+	for name, reported := range map[string]string{
+		"a long domain":             "user@" + label.String(),
+		"a long encoded local part": strings.Repeat("=?c?q?x", 64000) + "?=@example.com",
+	} {
+		t.Run(name, func(t *testing.T) {
+			start := time.Now()
+			assert.False(t, sameAddress("user@example.com", reported))
+			assert.Less(t, time.Since(start), time.Second)
+		})
+	}
+
+	// One delivery can hold thousands of events naming one email, each with its own address.
+	// Looked up, these took about two seconds together, without the race detector.
+	t.Run("many domains as long as DNS holds, against a short one", func(t *testing.T) {
+		reported := make([]string, 3000)
+		for i := range reported {
+			var domain strings.Builder
+			for j := 0; j < 253; j++ {
+				domain.WriteRune(rune(0x4e00 + (i+j)%20000))
+			}
+			reported[i] = "user@" + domain.String()
+		}
+
+		start := time.Now()
+		for _, address := range reported {
+			require.False(t, sameAddress("user@example.com", address))
+		}
+		assert.Less(t, time.Since(start), time.Second)
+	})
+}
+
+// sameAddress gives a reported domain as much room as the stored one's forms take, but one
+// longer than DNS holds is still not looked up.
+func TestAddressForm_ADomainLongerThanDNSHoldsIsNotLookedUp(t *testing.T) {
+	address := "user@" + strings.Repeat("\u00ad", 300) + "example.com"
+
+	form, ok := addressForm(address, 1000)
+
+	assert.True(t, ok)
+	assert.Equal(t, address, form)
 }
 
 func TestExtractXMessageIDFromHeaders(t *testing.T) {
@@ -1828,25 +2080,29 @@ func TestProcessMailjetWebhook(t *testing.T) {
 		assert.Equal(t, "Blocked by recipient server: 550", events[0].BounceDiagnostic)
 	})
 
+	// Mailjet reports "unsub" when a recipient unsubscribes through Mailjet: an opt-out,
+	// not a spam complaint
 	t.Run("Unsubscribe Event", func(t *testing.T) {
-		// Create test unsubscribe payload
 		payload := domain.MailjetWebhookPayload{
 			Event:     "unsub",
 			Time:      1672574400, // 2023-01-01T12:00:00Z
 			Email:     "test@example.com",
 			MessageID: 12345,
+			CustomID:  "notifuse-message-1",
 		}
 		rawPayload, err := json.Marshal(payload)
 		require.NoError(t, err)
 
-		// Call method
 		events, err := service.processMailjetWebhook(integrationID, rawPayload)
 
-		// Assert
-		assert.NoError(t, err)
-		assert.NotNil(t, events)
-		assert.Equal(t, domain.EmailEventComplaint, events[0].Type)
-		assert.Equal(t, "unsubscribe", events[0].ComplaintFeedbackType)
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		assert.Equal(t, domain.EmailEventUnsubscribe, events[0].Type)
+		assert.Empty(t, events[0].ComplaintFeedbackType, "an unsubscribe is no complaint")
+		assert.Equal(t, "test@example.com", events[0].RecipientEmail)
+		require.NotNil(t, events[0].MessageID)
+		assert.Equal(t, "notifuse-message-1", *events[0].MessageID, "the email is named by the CustomID Notifuse gave it")
+		assert.Equal(t, time.Unix(1672574400, 0), events[0].Timestamp)
 	})
 }
 
@@ -2299,6 +2555,7 @@ func TestProcessWebhook_AdditionalScenarios(t *testing.T) {
 	authService := mocks.NewMockAuthService(ctrl)
 	log := pkgmocks.NewMockLogger(ctrl)
 	log.EXPECT().WithField(gomock.Any(), gomock.Any()).Return(log).AnyTimes()
+	log.EXPECT().Info(gomock.Any()).AnyTimes()
 	log.EXPECT().Error(gomock.Any()).AnyTimes()
 	workspaceRepo := mocks.NewMockWorkspaceRepository(ctrl)
 	contactRepo := mocks.NewMockContactRepository(ctrl)
@@ -2340,6 +2597,8 @@ func TestProcessWebhook_AdditionalScenarios(t *testing.T) {
 
 		// Setup expectations
 		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspace, nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"message1"}).
+			Return(map[string]string{"message1": "test@example.com"}, nil)
 		repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
 		messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).DoAndReturn(
 			func(ctx context.Context, wsID string, updates []domain.MessageEventUpdate) error {
@@ -2380,6 +2639,8 @@ func TestProcessWebhook_AdditionalScenarios(t *testing.T) {
 
 		// Setup expectations
 		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspace, nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"message1"}).
+			Return(map[string]string{"message1": "test@example.com"}, nil)
 		repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
 		messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).DoAndReturn(
 			func(ctx context.Context, wsID string, updates []domain.MessageEventUpdate) error {
@@ -2394,7 +2655,7 @@ func TestProcessWebhook_AdditionalScenarios(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	t.Run("ProcessWebhook with events without message ID", func(t *testing.T) {
+	t.Run("ProcessWebhook with events without message ID: nothing is stored", func(t *testing.T) {
 		// Create test payload with empty message ID
 		payload := domain.SESWebhookPayload{
 			Message: `{"eventType":"Delivery","delivery":{"recipients":["test@example.com"],"timestamp":"2023-01-01T12:00:00Z"},"mail":{"messageId":""}}`,
@@ -2415,16 +2676,9 @@ func TestProcessWebhook_AdditionalScenarios(t *testing.T) {
 			},
 		}
 
-		// Setup expectations
+		// An event naming no email is not looked up, stored or applied: no expectation
+		// beyond the workspace
 		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspace, nil)
-		repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
-		// Should NOT call SetStatusesIfNotSet since there's no message ID
-		messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).DoAndReturn(
-			func(ctx context.Context, wsID string, updates []domain.MessageEventUpdate) error {
-				// Should be empty since no message ID
-				assert.Equal(t, 0, len(updates))
-				return nil
-			})
 
 		// Call method
 		err = service.ProcessWebhook(context.Background(), workspaceID, integrationID, rawPayload)
@@ -2454,6 +2708,8 @@ func TestProcessWebhook_AdditionalScenarios(t *testing.T) {
 
 		// Setup expectations with message history error
 		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspace, nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"message1"}).
+			Return(map[string]string{"message1": "test@example.com"}, nil)
 		repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
 		messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).Return(errors.New("message history error"))
 
@@ -2499,6 +2755,8 @@ func TestProcessWebhook_AdditionalScenarios(t *testing.T) {
 		// We'll use reflection or create a mock to simulate this
 		// For now, let's just test the actual supported types and ensure default case coverage
 		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspace, nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"message1"}).
+			Return(map[string]string{"message1": "test@example.com"}, nil)
 		repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
 		messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
 
@@ -2564,6 +2822,8 @@ func TestProcessWebhook_UpdatesMessageHistory(t *testing.T) {
 
 	// Setup expectations
 	workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspace, nil)
+	messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{messageID}).
+		Return(map[string]string{messageID: "test@example.com"}, nil)
 	repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).DoAndReturn(
 		func(ctx context.Context, workspaceID string, events []*domain.InboundWebhookEvent) error {
 			assert.Equal(t, workspace.ID, workspaceID)
@@ -2667,6 +2927,8 @@ func TestProcessWebhook_UpdatesMessageHistoryWithMultipleEvents(t *testing.T) {
 
 	// Setup expectations
 	workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspace, nil)
+	messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{messageID1, messageID2}).
+		Return(map[string]string{messageID1: "test1@example.com", messageID2: "test2@example.com"}, nil)
 	repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).DoAndReturn(
 		func(ctx context.Context, workspaceID string, events []*domain.InboundWebhookEvent) error {
 			assert.Equal(t, workspace.ID, workspaceID)
@@ -2775,6 +3037,8 @@ func TestProcessWebhook_SES_Permanent_HardBounce(t *testing.T) {
 	require.NoError(t, err)
 
 	workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(sesWorkspace(workspaceID, integrationID), nil)
+	messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-1"}).
+		Return(map[string]string{"msg-1": "hard@example.com"}, nil)
 	repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
 	messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
 	// Hard bounce: no count query, direct escalation.
@@ -2795,6 +3059,8 @@ func TestProcessWebhook_SES_TransientGeneral_BelowThreshold(t *testing.T) {
 	require.NoError(t, err)
 
 	workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(sesWorkspace(workspaceID, integrationID), nil)
+	messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-2"}).
+		Return(map[string]string{"msg-2": "soft@example.com"}, nil)
 	repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
 	// Soft bounce never produces a message_history update.
 	messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).DoAndReturn(
@@ -2824,6 +3090,8 @@ func TestProcessWebhook_SES_TransientGeneral_AtThreshold(t *testing.T) {
 	require.NoError(t, err)
 
 	workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(sesWorkspace(workspaceID, integrationID), nil)
+	messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-3"}).
+		Return(map[string]string{"msg-3": "chronic@example.com"}, nil)
 	repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
 	messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
 	// Count query returns 5 (== default threshold) → escalate.
@@ -2848,6 +3116,8 @@ func TestProcessWebhook_SES_TransientGeneral_RetryExhausted(t *testing.T) {
 	require.NoError(t, err)
 
 	workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(sesWorkspace(workspaceID, integrationID), nil)
+	messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-4"}).
+		Return(map[string]string{"msg-4": "expired@example.com"}, nil)
 	repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
 	messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
 	// CountConsecutiveSoftBounces MUST NOT be called — diagnostic promotion bypasses the counter.
@@ -2869,6 +3139,8 @@ func TestProcessWebhook_SES_MessageTooLarge_NoOp(t *testing.T) {
 	require.NoError(t, err)
 
 	workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(sesWorkspace(workspaceID, integrationID), nil)
+	messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-5"}).
+		Return(map[string]string{"msg-5": "big@example.com"}, nil)
 	repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
 	messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
 	// SoftIgnore: no count query, no escalation. (No EXPECT for either.)
@@ -2918,6 +3190,8 @@ func TestProcessWebhook_BatchedMixedClassifications(t *testing.T) {
 		},
 	}
 	workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspace, nil)
+	messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"m-h", "m-s1", "m-s2"}).
+		Return(map[string]string{"m-h": "hard@example.com", "m-s1": "soft1@example.com", "m-s2": "soft2@example.com"}, nil)
 	repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
 	messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
 
@@ -2942,6 +3216,719 @@ func TestProcessWebhook_BatchedMixedClassifications(t *testing.T) {
 		})
 
 	require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID, rawPayload))
+}
+
+// TestProcessWebhook_ActsOnlyOnEmailsSentToTheEventAddress: a provider event changes
+// nothing, and is not stored, unless it names an email of the workspace sent to the address
+// the event reports.
+func TestProcessWebhook_ActsOnlyOnEmailsSentToTheEventAddress(t *testing.T) {
+	workspaceID, integrationID := "ws1", "int1"
+
+	// sesBounce builds an SES bounce carrying the Notifuse id in its tag, or only SES's own
+	// id when notifuseID is empty.
+	sesBounce := func(t *testing.T, notifuseID, email, bounceType string) []byte {
+		t.Helper()
+		tags := ""
+		if notifuseID != "" {
+			tags = fmt.Sprintf(`,"tags":{"notifuse_message_id":[%q]}`, notifuseID)
+		}
+		raw, err := json.Marshal(domain.SESWebhookPayload{
+			Type: "Notification",
+			Message: fmt.Sprintf(`{"eventType":"Bounce","bounce":{"bounceType":%q,"bounceSubType":"General","bouncedRecipients":[{"emailAddress":%q,"diagnosticCode":"smtp; 550 5.1.1 user unknown"}],"timestamp":"2026-10-21T10:00:00Z"},"mail":{"messageId":"0100018f-ses-own-id"%s}}`,
+				bounceType, email, tags),
+		})
+		require.NoError(t, err)
+		return raw
+	}
+	workspaceOf := func(kind domain.EmailProviderKind) *domain.Workspace {
+		return &domain.Workspace{
+			ID:           workspaceID,
+			Integrations: []domain.Integration{{ID: integrationID, EmailProvider: domain.EmailProvider{Kind: kind}}},
+		}
+	}
+	sendGridBatch := func(t *testing.T, events ...map[string]interface{}) []byte {
+		t.Helper()
+		raw, err := json.Marshal(events)
+		require.NoError(t, err)
+		return raw
+	}
+	sendGridEvent := func(kind, notifuseID, email string) map[string]interface{} {
+		event := map[string]interface{}{
+			"event":         kind,
+			"email":         email,
+			"timestamp":     time.Date(2026, 10, 21, 10, 0, 0, 0, time.UTC).Unix(),
+			"sg_message_id": "sg-own-id." + kind,
+		}
+		if notifuseID != "" {
+			event["notifuse_message_id"] = notifuseID
+		}
+		return event
+	}
+
+	// Each case leaves out the expectations of everything an event could change: gomock
+	// fails the test on any call to StoreEvents, SetStatusesIfNotSet,
+	// CountConsecutiveSoftBounces, MarkEmailsAsBounced or GetRecipientAndList it does not
+	// expect.
+	t.Run("a hard bounce naming no email of the workspace: nothing is stored or changed", func(t *testing.T) {
+		service, _, workspaceRepo, messageHistoryRepo, _, ctrl := newClassificationTestService(t)
+		defer ctrl.Finish()
+		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindSES), nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-unknown"}).Return(map[string]string{}, nil)
+
+		require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID,
+			sesBounce(t, "msg-unknown", "victim@example.com", "Permanent")))
+	})
+
+	t.Run("a hard bounce naming an email sent to another address: nothing is stored or changed", func(t *testing.T) {
+		service, _, workspaceRepo, messageHistoryRepo, _, ctrl := newClassificationTestService(t)
+		defer ctrl.Finish()
+		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindSES), nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-1"}).
+			Return(map[string]string{"msg-1": "recipient@example.com"}, nil)
+
+		require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID,
+			sesBounce(t, "msg-1", "victim@example.com", "Permanent")))
+	})
+
+	t.Run("a soft bounce naming no email of the workspace is not counted", func(t *testing.T) {
+		service, _, workspaceRepo, messageHistoryRepo, _, ctrl := newClassificationTestService(t)
+		defer ctrl.Finish()
+		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindSES), nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-unknown"}).Return(map[string]string{}, nil)
+
+		require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID,
+			sesBounce(t, "msg-unknown", "victim@example.com", "Transient")))
+	})
+
+	t.Run("an event carrying only the provider's own id is ignored", func(t *testing.T) {
+		service, _, workspaceRepo, messageHistoryRepo, _, ctrl := newClassificationTestService(t)
+		defer ctrl.Finish()
+		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindSES), nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"0100018f-ses-own-id"}).
+			Return(map[string]string{}, nil)
+
+		require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID,
+			sesBounce(t, "", "recipient@example.com", "Permanent")))
+	})
+
+	t.Run("events with no email id or no address: nothing is looked up or stored", func(t *testing.T) {
+		service, _, workspaceRepo, _, _, ctrl := newClassificationTestService(t)
+		defer ctrl.Finish()
+		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindSendGrid), nil)
+		noID := sendGridEvent("bounce", "", "recipient@example.com")
+		delete(noID, "sg_message_id")
+
+		require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID,
+			sendGridBatch(t, noID, sendGridEvent("bounce", "msg-1", ""))))
+	})
+
+	t.Run("a hard bounce naming an email sent to its address in another case: recorded and applied with the address stored on the email", func(t *testing.T) {
+		service, repo, workspaceRepo, messageHistoryRepo, contactRepo, ctrl := newClassificationTestService(t)
+		defer ctrl.Finish()
+		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindSES), nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-1"}).
+			Return(map[string]string{"msg-1": "Recipient@Example.com"}, nil)
+		repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).DoAndReturn(
+			func(_ context.Context, _ string, events []*domain.InboundWebhookEvent) error {
+				require.Len(t, events, 1)
+				assert.Equal(t, "Recipient@Example.com", events[0].RecipientEmail)
+				assert.Equal(t, "msg-1", *events[0].MessageID)
+				return nil
+			})
+		messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).DoAndReturn(
+			func(_ context.Context, _ string, updates []domain.MessageEventUpdate) error {
+				require.Len(t, updates, 1)
+				assert.Equal(t, "msg-1", updates[0].ID)
+				assert.Equal(t, domain.MessageEventBounced, updates[0].Event)
+				return nil
+			})
+		contactRepo.EXPECT().MarkEmailsAsBounced(gomock.Any(), workspaceID, []string{"Recipient@Example.com"}, gomock.Any()).Return(nil)
+
+		require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID,
+			sesBounce(t, "msg-1", "recipient@example.com", "Permanent")))
+	})
+
+	t.Run("a soft bounce naming an email sent to its address is counted under the address stored on the email", func(t *testing.T) {
+		service, repo, workspaceRepo, messageHistoryRepo, _, ctrl := newClassificationTestService(t)
+		defer ctrl.Finish()
+		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindSES), nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-1"}).
+			Return(map[string]string{"msg-1": "Recipient@Example.com"}, nil)
+		repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
+		messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
+		repo.EXPECT().CountConsecutiveSoftBounces(gomock.Any(), workspaceID, []string{"Recipient@Example.com"}).
+			Return(map[string]int{"Recipient@Example.com": 1}, nil)
+
+		require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID,
+			sesBounce(t, "msg-1", "RECIPIENT@example.com", "Transient")))
+	})
+
+	t.Run("a complaint and a delivery naming an email sent to another address change no status", func(t *testing.T) {
+		service, _, workspaceRepo, messageHistoryRepo, _, ctrl := newClassificationTestService(t)
+		defer ctrl.Finish()
+		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindSendGrid), nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-1"}).
+			Return(map[string]string{"msg-1": "recipient@example.com"}, nil)
+
+		require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID, sendGridBatch(t,
+			sendGridEvent("spamreport", "msg-1", "someone-else@example.com"),
+			sendGridEvent("delivered", "msg-1", "someone-else@example.com"))))
+	})
+
+	t.Run("a batch: one lookup, then only the events of emails sent to their address are stored and applied", func(t *testing.T) {
+		service, repo, workspaceRepo, messageHistoryRepo, contactRepo, ctrl := newClassificationTestService(t)
+		defer ctrl.Finish()
+		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindSendGrid), nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-1", "msg-unknown", "msg-2"}).
+			Return(map[string]string{"msg-1": "first@example.com", "msg-2": "second@example.com"}, nil)
+		repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).DoAndReturn(
+			func(_ context.Context, _ string, events []*domain.InboundWebhookEvent) error {
+				require.Len(t, events, 2)
+				assert.Equal(t, domain.EmailEventDelivered, events[0].Type)
+				assert.Equal(t, "msg-1", *events[0].MessageID)
+				assert.Equal(t, domain.EmailEventBounce, events[1].Type)
+				assert.Equal(t, "msg-2", *events[1].MessageID)
+				return nil
+			})
+		messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).DoAndReturn(
+			func(_ context.Context, _ string, updates []domain.MessageEventUpdate) error {
+				require.Len(t, updates, 2)
+				assert.Equal(t, "msg-1", updates[0].ID)
+				assert.Equal(t, domain.MessageEventDelivered, updates[0].Event)
+				assert.Equal(t, "msg-2", updates[1].ID)
+				assert.Equal(t, domain.MessageEventBounced, updates[1].Event)
+				return nil
+			})
+		contactRepo.EXPECT().MarkEmailsAsBounced(gomock.Any(), workspaceID, []string{"second@example.com"}, gomock.Any()).Return(nil)
+
+		require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID, sendGridBatch(t,
+			sendGridEvent("delivered", "msg-1", "first@example.com"),
+			sendGridEvent("bounce", "msg-unknown", "victim@example.com"),
+			sendGridEvent("spamreport", "msg-1", "someone-else@example.com"),
+			sendGridEvent("bounce", "msg-2", "second@example.com"))))
+	})
+
+	t.Run("an unsubscribe naming no email of the workspace is not stored", func(t *testing.T) {
+		service, _, workspaceRepo, messageHistoryRepo, _, ctrl := newClassificationTestService(t)
+		defer ctrl.Finish()
+		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindMailjet), nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-unknown"}).Return(map[string]string{}, nil)
+		raw, err := json.Marshal(domain.MailjetWebhookPayload{
+			Event: "unsub", Time: 1761040800, Email: "victim@example.com", MessageID: 1, CustomID: "msg-unknown",
+		})
+		require.NoError(t, err)
+
+		require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID, raw))
+	})
+
+	// sesNotification wraps an SES notification of the email msg-1 names
+	sesNotification := func(t *testing.T, message string) []byte {
+		t.Helper()
+		raw, err := json.Marshal(domain.SESWebhookPayload{Type: "Notification", Message: message})
+		require.NoError(t, err)
+		return raw
+	}
+	sesMail := `"mail":{"messageId":"0100018f-ses-own-id","tags":{"notifuse_message_id":["msg-1"]}}`
+
+	t.Run("an SES bounce listing an address the email was copied to before its recipient: the recipient's bounce is recorded and applied", func(t *testing.T) {
+		service, repo, workspaceRepo, messageHistoryRepo, contactRepo, ctrl := newClassificationTestService(t)
+		defer ctrl.Finish()
+		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindSES), nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-1"}).
+			Return(map[string]string{"msg-1": "recipient@example.com"}, nil)
+		repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).DoAndReturn(
+			func(_ context.Context, _ string, events []*domain.InboundWebhookEvent) error {
+				require.Len(t, events, 1)
+				assert.Equal(t, "recipient@example.com", events[0].RecipientEmail)
+				assert.Equal(t, "smtp; 550 recipient", events[0].BounceDiagnostic)
+				return nil
+			})
+		messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).DoAndReturn(
+			func(_ context.Context, _ string, updates []domain.MessageEventUpdate) error {
+				require.Len(t, updates, 1)
+				assert.Equal(t, "msg-1", updates[0].ID)
+				assert.Equal(t, domain.MessageEventBounced, updates[0].Event)
+				return nil
+			})
+		contactRepo.EXPECT().MarkEmailsAsBounced(gomock.Any(), workspaceID, []string{"recipient@example.com"}, gomock.Any()).Return(nil)
+
+		require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID, sesNotification(t,
+			`{"eventType":"Bounce","bounce":{"bounceType":"Permanent","bounceSubType":"General","bouncedRecipients":[{"emailAddress":"copy@example.com","diagnosticCode":"smtp; 550 copy"},{"emailAddress":"recipient@example.com","diagnosticCode":"smtp; 550 recipient"}],"timestamp":"2026-10-21T10:00:00Z"},`+sesMail+`}`)))
+	})
+
+	for name, c := range map[string]struct {
+		message string
+		event   domain.MessageEvent
+	}{
+		"complaint": {
+			message: `{"eventType":"Complaint","complaint":{"complainedRecipients":[{"emailAddress":"copy@example.com"},{"emailAddress":"recipient@example.com"}],"timestamp":"2026-10-21T10:00:00Z","complaintFeedbackType":"abuse"},` + sesMail + `}`,
+			event:   domain.MessageEventComplained,
+		},
+		"delivery": {
+			message: `{"eventType":"Delivery","delivery":{"recipients":["copy@example.com","recipient@example.com"],"timestamp":"2026-10-21T10:00:00Z"},` + sesMail + `}`,
+			event:   domain.MessageEventDelivered,
+		},
+	} {
+		t.Run("an SES "+name+" listing an address the email was copied to before its recipient: the recipient's "+name+" is recorded", func(t *testing.T) {
+			service, repo, workspaceRepo, messageHistoryRepo, _, ctrl := newClassificationTestService(t)
+			defer ctrl.Finish()
+			workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindSES), nil)
+			messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-1"}).
+				Return(map[string]string{"msg-1": "recipient@example.com"}, nil)
+			repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).DoAndReturn(
+				func(_ context.Context, _ string, events []*domain.InboundWebhookEvent) error {
+					require.Len(t, events, 1)
+					assert.Equal(t, "recipient@example.com", events[0].RecipientEmail)
+					return nil
+				})
+			messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).DoAndReturn(
+				func(_ context.Context, _ string, updates []domain.MessageEventUpdate) error {
+					require.Len(t, updates, 1)
+					assert.Equal(t, "msg-1", updates[0].ID)
+					assert.Equal(t, c.event, updates[0].Event)
+					return nil
+				})
+
+			require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID, sesNotification(t, c.message)))
+		})
+	}
+
+	t.Run("an SES bounce reporting the address an email sent to its recipient alone was forwarded to: nothing is stored or changed", func(t *testing.T) {
+		service, _, workspaceRepo, messageHistoryRepo, _, ctrl := newClassificationTestService(t)
+		defer ctrl.Finish()
+		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindSES), nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-1"}).
+			Return(map[string]string{"msg-1": "recipient@example.com"}, nil)
+
+		require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID, sesNotification(t,
+			`{"eventType":"Bounce","bounce":{"bounceType":"Permanent","bounceSubType":"General","bouncedRecipients":[{"emailAddress":"forwarded@elsewhere.example","diagnosticCode":"smtp; 550 forwarded"}],"timestamp":"2026-10-21T10:00:00Z"},"mail":{"messageId":"0100018f-ses-own-id","destination":["recipient@example.com"],"tags":{"notifuse_message_id":["msg-1"]}}}`)))
+	})
+
+	t.Run("an SES complaint giving the international domain of the email's address in Punycode, as SES is sent it: recorded with the address stored on the email", func(t *testing.T) {
+		service, repo, workspaceRepo, messageHistoryRepo, _, ctrl := newClassificationTestService(t)
+		defer ctrl.Finish()
+		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindSES), nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-1"}).
+			Return(map[string]string{"msg-1": "user@münchen.de"}, nil)
+		repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).DoAndReturn(
+			func(_ context.Context, _ string, events []*domain.InboundWebhookEvent) error {
+				require.Len(t, events, 1)
+				assert.Equal(t, "user@münchen.de", events[0].RecipientEmail)
+				return nil
+			})
+		messageHistoryRepo.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).DoAndReturn(
+			func(_ context.Context, _ string, updates []domain.MessageEventUpdate) error {
+				require.Len(t, updates, 1)
+				assert.Equal(t, domain.MessageEventComplained, updates[0].Event)
+				return nil
+			})
+
+		require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID, sesNotification(t,
+			`{"eventType":"Complaint","complaint":{"complainedRecipients":[{"emailAddress":"user@xn--mnchen-3ya.de"}],"timestamp":"2026-10-21T10:00:00Z","complaintFeedbackType":"abuse"},`+sesMail+`}`)))
+	})
+
+	t.Run("the lookup fails: the error is returned and nothing is stored", func(t *testing.T) {
+		service, _, workspaceRepo, messageHistoryRepo, _, ctrl := newClassificationTestService(t)
+		defer ctrl.Finish()
+		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindSES), nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-1"}).
+			Return(nil, errors.New("connection reset"))
+
+		err := service.ProcessWebhook(context.Background(), workspaceID, integrationID,
+			sesBounce(t, "msg-1", "recipient@example.com", "Permanent"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "connection reset")
+	})
+
+	t.Run("ignored events are logged once, with their number and the first id, without addresses", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+		workspaceRepo := mocks.NewMockWorkspaceRepository(ctrl)
+		messageHistoryRepo := mocks.NewMockMessageHistoryRepository(ctrl)
+		log := pkgmocks.NewMockLogger(ctrl)
+		fields := map[string]interface{}{}
+		log.EXPECT().WithField(gomock.Any(), gomock.Any()).DoAndReturn(func(key string, value interface{}) logger.Logger {
+			fields[key] = value
+			return log
+		}).AnyTimes()
+		log.EXPECT().Info("Ignored provider events that name no email sent to their address").Times(1)
+		service := &InboundWebhookEventService{
+			logger:             log,
+			workspaceRepo:      workspaceRepo,
+			messageHistoryRepo: messageHistoryRepo,
+		}
+		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindSendGrid), nil)
+		messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{"msg-unknown", "msg-1"}).
+			Return(map[string]string{"msg-1": "recipient@example.com"}, nil)
+
+		require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID, sendGridBatch(t,
+			sendGridEvent("bounce", "msg-unknown", "victim@example.com"),
+			sendGridEvent("bounce", "msg-1", "someone-else@example.com"))))
+
+		assert.Equal(t, map[string]interface{}{
+			"workspace_id":     workspaceID,
+			"integration_id":   integrationID,
+			"ignored":          2,
+			"first_message_id": "msg-unknown",
+		}, fields)
+	})
+
+	for name, tc := range map[string]struct{ id, logged string }{
+		"a long ignored id is logged cut to its first 255 bytes": {
+			id: strings.Repeat("a", 300), logged: strings.Repeat("a", 255) + "…(truncated)",
+		},
+		// Two bytes a character, so byte 255 falls inside the 128th
+		"a long ignored id is cut on a character boundary": {
+			id: strings.Repeat("é", 200), logged: strings.Repeat("é", 127) + "…(truncated)",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+			workspaceRepo := mocks.NewMockWorkspaceRepository(ctrl)
+			messageHistoryRepo := mocks.NewMockMessageHistoryRepository(ctrl)
+			log := pkgmocks.NewMockLogger(ctrl)
+			fields := map[string]interface{}{}
+			log.EXPECT().WithField(gomock.Any(), gomock.Any()).DoAndReturn(func(key string, value interface{}) logger.Logger {
+				fields[key] = value
+				return log
+			}).AnyTimes()
+			log.EXPECT().Info("Ignored provider events that name no email sent to their address").Times(1)
+			service := &InboundWebhookEventService{
+				logger:             log,
+				workspaceRepo:      workspaceRepo,
+				messageHistoryRepo: messageHistoryRepo,
+			}
+			workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(workspaceOf(domain.EmailProviderKindSendGrid), nil)
+			messageHistoryRepo.EXPECT().GetRecipients(gomock.Any(), workspaceID, []string{tc.id}).
+				Return(map[string]string{}, nil)
+
+			require.NoError(t, service.ProcessWebhook(context.Background(), workspaceID, integrationID, sendGridBatch(t,
+				sendGridEvent("bounce", tc.id, "victim@example.com"))))
+
+			assert.Equal(t, tc.logged, fields["first_message_id"])
+		})
+	}
+}
+
+// TestProcessWebhook_MailjetUnsubscribe posts Mailjet "unsub" events through ProcessWebhook.
+// An unsubscribe of the email's own recipient marks the email unsubscribed, after the list
+// service recorded the opt-out on the list found for the email, when there is one. It never
+// becomes a complaint.
+func TestProcessWebhook_MailjetUnsubscribe(t *testing.T) {
+	workspaceID, integrationID := "ws1", "int1"
+	listID := "list-1"
+	unsubscribedAt := time.Unix(1672574400, 0)
+	mailjetWorkspace := &domain.Workspace{
+		ID: workspaceID,
+		Integrations: []domain.Integration{
+			{ID: integrationID, EmailProvider: domain.EmailProvider{Kind: domain.EmailProviderKindMailjet}},
+		},
+	}
+	unsub := func(messageID, email string) domain.MailjetWebhookPayload {
+		return domain.MailjetWebhookPayload{
+			Event: "unsub", Time: unsubscribedAt.Unix(), Email: email, MessageID: 12345, CustomID: messageID,
+		}
+	}
+	sentFor := func(email string, listID *string) *domain.MessageHistory {
+		return &domain.MessageHistory{ContactEmail: email, ListID: listID}
+	}
+	marked := func(messageIDs ...string) []domain.MessageEventUpdate {
+		updates := make([]domain.MessageEventUpdate, 0, len(messageIDs))
+		for _, id := range messageIDs {
+			updates = append(updates, domain.MessageEventUpdate{ID: id, Event: domain.MessageEventUnsubscribed, Timestamp: unsubscribedAt})
+		}
+		return updates
+	}
+
+	type fixture struct {
+		service      *InboundWebhookEventService
+		repo         *mocks.MockInboundWebhookEventRepository
+		history      *mocks.MockMessageHistoryRepository
+		unsubscriber *servicemocks.MockListUnsubscriber
+	}
+	// setup returns a service whose controller finishes with the subtest. gomock fails the
+	// subtest on any call it did not expect, a call to the list service included.
+	setup := func(t *testing.T) fixture {
+		service, repo, workspaceRepo, history, _, ctrl := newClassificationTestService(t)
+		f := fixture{service: service, repo: repo, history: history, unsubscriber: servicemocks.NewMockListUnsubscriber(ctrl)}
+		service.listUnsubscriber = f.unsubscriber
+		workspaceRepo.EXPECT().GetByID(gomock.Any(), workspaceID).Return(mailjetWorkspace, nil)
+		return f
+	}
+	// expectNoComplaint expects the status update of the delivery's deliveries, bounces and
+	// complaints, which every delivery makes, to hold nothing
+	expectNoComplaint := func(t *testing.T, f fixture) *gomock.Call {
+		return f.history.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ string, updates []domain.MessageEventUpdate) error {
+				assert.Empty(t, updates, "an unsubscribe is no complaint")
+				return nil
+			})
+	}
+	// sentTo expects the check of the emails the delivery names, which finds them sent to
+	// these addresses
+	sentTo := func(f fixture, recipients map[string]string) {
+		f.history.EXPECT().GetRecipients(gomock.Any(), workspaceID, gomock.Any()).Return(recipients, nil)
+	}
+	process := func(t *testing.T, f fixture, events ...domain.MailjetWebhookPayload) error {
+		t.Helper()
+		raw, err := json.Marshal(events)
+		require.NoError(t, err)
+		return f.service.ProcessWebhook(context.Background(), workspaceID, integrationID, raw)
+	}
+
+	t.Run("an email sent for a list: the opt-out is recorded on that list, then the email is marked unsubscribed", func(t *testing.T) {
+		f := setup(t)
+		sentTo(f, map[string]string{"msg-1": "jane@example.com"})
+		f.repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ string, events []*domain.InboundWebhookEvent) error {
+				require.Len(t, events, 1)
+				assert.Equal(t, domain.EmailEventUnsubscribe, events[0].Type)
+				return nil
+			})
+		gomock.InOrder(
+			expectNoComplaint(t, f),
+			f.history.EXPECT().GetRecipientAndList(gomock.Any(), workspaceID, "msg-1").Return(sentFor("jane@example.com", &listID), nil),
+			f.unsubscriber.EXPECT().UnsubscribeFromMessageList(gomock.Any(), workspaceID, "jane@example.com", listID, "msg-1").Return(nil),
+			f.history.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, marked("msg-1")).Return(nil),
+		)
+
+		require.NoError(t, process(t, f, unsub("msg-1", "jane@example.com")))
+	})
+
+	t.Run("the address as stored is unsubscribed, whatever its case in the event", func(t *testing.T) {
+		f := setup(t)
+		sentTo(f, map[string]string{"msg-1": "jane@example.com"})
+		f.repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
+		expectNoComplaint(t, f)
+		f.history.EXPECT().GetRecipientAndList(gomock.Any(), workspaceID, "msg-1").Return(sentFor("jane@example.com", &listID), nil)
+		f.unsubscriber.EXPECT().UnsubscribeFromMessageList(gomock.Any(), workspaceID, "jane@example.com", listID, "msg-1").Return(nil)
+		f.history.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, marked("msg-1")).Return(nil)
+
+		require.NoError(t, process(t, f, unsub("msg-1", "Jane@Example.com")))
+	})
+
+	// Transactional email, which Mailjet still sends, is sent for no list
+	emptyList := ""
+	for name, message := range map[string]*domain.MessageHistory{
+		"an email sent for no list, such as a transactional one": sentFor("jane@example.com", nil),
+		"an email stored with an empty list":                     sentFor("jane@example.com", &emptyList),
+	} {
+		message := message
+		t.Run(name+": the email is marked unsubscribed, and no list is touched", func(t *testing.T) {
+			f := setup(t)
+			sentTo(f, map[string]string{"msg-1": "jane@example.com"})
+			f.repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
+			// gomock fails the test on a call to the list service
+			gomock.InOrder(
+				expectNoComplaint(t, f),
+				f.history.EXPECT().GetRecipientAndList(gomock.Any(), workspaceID, "msg-1").Return(message, nil),
+				f.history.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, marked("msg-1")).Return(nil),
+			)
+
+			require.NoError(t, process(t, f, unsub("msg-1", "jane@example.com")))
+		})
+	}
+
+	// Mailjet's webhooks cover the whole Mailjet account, and an email can be copied to
+	// someone: such an unsubscribe is not even stored
+	t.Run("an email Notifuse did not send, and an email to another address such as a copy: nothing is stored or recorded", func(t *testing.T) {
+		f := setup(t)
+		// gomock fails the test on any call past the check
+		sentTo(f, map[string]string{"msg-2": "john@example.com"})
+
+		require.NoError(t, process(t, f, unsub("msg-1", "jane@example.com"), unsub("msg-2", "jane@example.com")))
+	})
+
+	// The email is read again to record the opt-out, after the check: a contact erased in
+	// between leaves it with the address redacted
+	for name, message := range map[string]*domain.MessageHistory{
+		"the email is gone":                             nil,
+		"the email names another address":               sentFor("john@example.com", &listID),
+		"its contact is erased":                         sentFor("DELETED_EMAIL", &listID),
+		"the contact of an email for no list is erased": sentFor("DELETED_EMAIL", nil),
+	} {
+		message := message
+		t.Run(name+" by the time the opt-out is recorded: nothing is recorded", func(t *testing.T) {
+			f := setup(t)
+			sentTo(f, map[string]string{"msg-1": "jane@example.com"})
+			f.repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
+			// gomock fails the test on a call to the list service, or on a second status update
+			expectNoComplaint(t, f)
+			f.history.EXPECT().GetRecipientAndList(gomock.Any(), workspaceID, "msg-1").Return(message, nil)
+
+			require.NoError(t, process(t, f, unsub("msg-1", "jane@example.com")))
+		})
+	}
+
+	t.Run("one delivery: the emails of their own recipients are marked in one update", func(t *testing.T) {
+		f := setup(t)
+		sentTo(f, map[string]string{"msg-1": "msg-1@example.com", "msg-2": "john@example.com", "msg-3": "msg-3@example.com"})
+		f.repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ string, events []*domain.InboundWebhookEvent) error {
+				require.Len(t, events, 2, "the unsubscribe of another address than the email's is left out")
+				return nil
+			})
+		expectNoComplaint(t, f)
+		f.history.EXPECT().GetRecipientAndList(gomock.Any(), workspaceID, "msg-1").Return(sentFor("msg-1@example.com", &listID), nil)
+		f.history.EXPECT().GetRecipientAndList(gomock.Any(), workspaceID, "msg-3").Return(sentFor("msg-3@example.com", nil), nil)
+		f.unsubscriber.EXPECT().UnsubscribeFromMessageList(gomock.Any(), workspaceID, "msg-1@example.com", listID, "msg-1").Return(nil)
+		f.history.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, marked("msg-1", "msg-3")).Return(nil)
+
+		require.NoError(t, process(t, f,
+			unsub("msg-1", "msg-1@example.com"), unsub("msg-2", "msg-2@example.com"), unsub("msg-3", "msg-3@example.com")))
+	})
+
+	// People who report spam often unsubscribe too, and Mailjet can post both in one delivery
+	t.Run("a complaint and an unsubscribe in one delivery: the complaint first, the opt-out after", func(t *testing.T) {
+		f := setup(t)
+		spam := domain.MailjetWebhookPayload{
+			Event: "spam", Time: unsubscribedAt.Unix(), Email: "john@example.com", MessageID: 12345, CustomID: "msg-1", Source: "JMRPP",
+		}
+		sentTo(f, map[string]string{"msg-1": "john@example.com", "msg-2": "jane@example.com"})
+		f.repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
+		gomock.InOrder(
+			f.history.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, gomock.Any()).
+				DoAndReturn(func(_ context.Context, _ string, updates []domain.MessageEventUpdate) error {
+					require.Len(t, updates, 1)
+					assert.Equal(t, "msg-1", updates[0].ID)
+					assert.Equal(t, domain.MessageEventComplained, updates[0].Event)
+					return nil
+				}),
+			f.history.EXPECT().GetRecipientAndList(gomock.Any(), workspaceID, "msg-2").Return(sentFor("jane@example.com", &listID), nil),
+			f.unsubscriber.EXPECT().UnsubscribeFromMessageList(gomock.Any(), workspaceID, "jane@example.com", listID, "msg-2").Return(nil),
+			f.history.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, marked("msg-2")).Return(nil),
+		)
+
+		require.NoError(t, process(t, f, spam, unsub("msg-2", "jane@example.com")))
+	})
+
+	// An error answers the delivery with 400, and Mailjet posts it again
+	t.Run("error - the email lookup fails", func(t *testing.T) {
+		f := setup(t)
+		sentTo(f, map[string]string{"msg-1": "jane@example.com"})
+		f.repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
+		expectNoComplaint(t, f)
+		f.history.EXPECT().GetRecipientAndList(gomock.Any(), workspaceID, "msg-1").Return(nil, errors.New("connection refused"))
+
+		err := process(t, f, unsub("msg-1", "jane@example.com"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to record unsubscribes")
+		assert.Contains(t, err.Error(), "connection refused")
+	})
+
+	t.Run("error - the list service fails: the email is not marked", func(t *testing.T) {
+		f := setup(t)
+		sentTo(f, map[string]string{"msg-1": "jane@example.com"})
+		f.repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
+		// gomock fails the test on a second status update
+		expectNoComplaint(t, f)
+		f.history.EXPECT().GetRecipientAndList(gomock.Any(), workspaceID, "msg-1").Return(sentFor("jane@example.com", &listID), nil)
+		f.unsubscriber.EXPECT().UnsubscribeFromMessageList(gomock.Any(), workspaceID, "jane@example.com", listID, "msg-1").
+			Return(errors.New("connection refused"))
+
+		err := process(t, f, unsub("msg-1", "jane@example.com"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to record unsubscribes")
+		assert.Contains(t, err.Error(), "msg-1")
+		assert.Contains(t, err.Error(), "connection refused")
+	})
+
+	// The opt-outs recorded before the failure are committed: their emails are marked now,
+	// not on Mailjet's retry. The emails after it wait for the retry.
+	t.Run("error - a later email's list opt-out fails: the emails before it are marked", func(t *testing.T) {
+		f := setup(t)
+		sentTo(f, map[string]string{"msg-1": "jane@example.com", "msg-2": "john@example.com", "msg-3": "jim@example.com"})
+		f.repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
+		gomock.InOrder(
+			expectNoComplaint(t, f),
+			f.history.EXPECT().GetRecipientAndList(gomock.Any(), workspaceID, "msg-1").Return(sentFor("jane@example.com", &listID), nil),
+			f.unsubscriber.EXPECT().UnsubscribeFromMessageList(gomock.Any(), workspaceID, "jane@example.com", listID, "msg-1").Return(nil),
+			f.history.EXPECT().GetRecipientAndList(gomock.Any(), workspaceID, "msg-2").Return(sentFor("john@example.com", &listID), nil),
+			f.unsubscriber.EXPECT().UnsubscribeFromMessageList(gomock.Any(), workspaceID, "john@example.com", listID, "msg-2").
+				Return(errors.New("connection refused")),
+			f.history.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, marked("msg-1")).Return(nil),
+		)
+
+		err := process(t, f, unsub("msg-1", "jane@example.com"), unsub("msg-2", "john@example.com"), unsub("msg-3", "jim@example.com"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to record unsubscribes")
+		assert.Contains(t, err.Error(), "msg-2")
+		assert.Contains(t, err.Error(), "connection refused")
+	})
+
+	t.Run("error - a later email's lookup fails: the emails before it are marked", func(t *testing.T) {
+		f := setup(t)
+		sentTo(f, map[string]string{"msg-1": "jane@example.com", "msg-2": "john@example.com"})
+		f.repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
+		gomock.InOrder(
+			expectNoComplaint(t, f),
+			f.history.EXPECT().GetRecipientAndList(gomock.Any(), workspaceID, "msg-1").Return(sentFor("jane@example.com", nil), nil),
+			f.history.EXPECT().GetRecipientAndList(gomock.Any(), workspaceID, "msg-2").Return(nil, errors.New("connection refused")),
+			f.history.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, marked("msg-1")).Return(nil),
+		)
+
+		err := process(t, f, unsub("msg-1", "jane@example.com"), unsub("msg-2", "john@example.com"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to record unsubscribes")
+		assert.Contains(t, err.Error(), "connection refused")
+	})
+
+	t.Run("error - a later email fails and marking the ones before it fails too: both errors are returned", func(t *testing.T) {
+		f := setup(t)
+		sentTo(f, map[string]string{"msg-1": "jane@example.com", "msg-2": "john@example.com"})
+		f.repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
+		optOutErr := errors.New("list update: connection refused")
+		markErr := errors.New("status update: connection refused")
+		gomock.InOrder(
+			expectNoComplaint(t, f),
+			f.history.EXPECT().GetRecipientAndList(gomock.Any(), workspaceID, "msg-1").Return(sentFor("jane@example.com", &listID), nil),
+			f.unsubscriber.EXPECT().UnsubscribeFromMessageList(gomock.Any(), workspaceID, "jane@example.com", listID, "msg-1").Return(nil),
+			f.history.EXPECT().GetRecipientAndList(gomock.Any(), workspaceID, "msg-2").Return(sentFor("john@example.com", &listID), nil),
+			f.unsubscriber.EXPECT().UnsubscribeFromMessageList(gomock.Any(), workspaceID, "john@example.com", listID, "msg-2").Return(optOutErr),
+			f.history.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, marked("msg-1")).Return(markErr),
+		)
+
+		err := process(t, f, unsub("msg-1", "jane@example.com"), unsub("msg-2", "john@example.com"))
+		require.Error(t, err)
+		assert.ErrorIs(t, err, optOutErr)
+		assert.ErrorIs(t, err, markErr)
+		assert.Contains(t, err.Error(), "failed to record unsubscribes")
+	})
+
+	t.Run("error - marking the email fails", func(t *testing.T) {
+		f := setup(t)
+		sentTo(f, map[string]string{"msg-1": "jane@example.com"})
+		f.repo.EXPECT().StoreEvents(gomock.Any(), workspaceID, gomock.Any()).Return(nil)
+		markErr := errors.New("connection refused")
+		gomock.InOrder(
+			expectNoComplaint(t, f),
+			f.history.EXPECT().GetRecipientAndList(gomock.Any(), workspaceID, "msg-1").Return(sentFor("jane@example.com", &listID), nil),
+			f.unsubscriber.EXPECT().UnsubscribeFromMessageList(gomock.Any(), workspaceID, "jane@example.com", listID, "msg-1").Return(nil),
+			f.history.EXPECT().SetStatusesIfNotSet(gomock.Any(), workspaceID, marked("msg-1")).Return(markErr),
+		)
+
+		err := process(t, f, unsub("msg-1", "jane@example.com"))
+		require.Error(t, err)
+		assert.ErrorIs(t, err, markErr)
+		assert.Contains(t, err.Error(), "failed to record unsubscribes")
+	})
+}
+
+// A provider event may carry no message ID; Mailjet's always carries one, the CustomID or
+// Mailjet's own.
+func TestRecordUnsubscribes_SkipsEventsWithoutMessageID(t *testing.T) {
+	service, _, _, _, _, ctrl := newClassificationTestService(t)
+	defer ctrl.Finish()
+	service.listUnsubscriber = servicemocks.NewMockListUnsubscriber(ctrl)
+	empty := ""
+
+	// gomock fails the test on any call to the message history repository or the list service
+	err := service.recordUnsubscribes(context.Background(), "ws1", []*domain.InboundWebhookEvent{
+		{Type: domain.EmailEventUnsubscribe, RecipientEmail: "jane@example.com"},
+		{Type: domain.EmailEventUnsubscribe, RecipientEmail: "jane@example.com", MessageID: &empty},
+	})
+	require.NoError(t, err)
 }
 
 // TestListEvents tests the ListEvents method of WebhookEventService
@@ -3252,5 +4239,78 @@ func TestInboundWebhookEventService_PermissionEnforcement(t *testing.T) {
 		require.Error(t, err)
 		assert.Nil(t, result)
 		assert.IsType(t, &domain.PermissionError{}, err)
+	})
+}
+
+// Providers that batch events must give each event its own element of the
+// batch as raw payload, never the whole batch: storing the batch on every event
+// grows with the square of its size, and puts every recipient of the batch on
+// each event's row.
+func TestBatchedProviderEventsKeepTheirOwnPayload(t *testing.T) {
+	service := &InboundWebhookEventService{}
+	integrationID := "integration1"
+
+	sendGridFirst := `{"email":"first@example.com","timestamp":1706097600,"event":"delivered","sg_message_id":"sg1","notifuse_message_id":"msg_1"}`
+	sendGridSecond := `{"email":"second@example.com","timestamp":1706097600,"event":"bounce","type":"bounce","reason":"unknown user","sg_message_id":"sg2"}`
+	sparkPostFirst := `{"msys":{"message_event":{"type":"delivery","rcpt_to":"first@example.com","message_id":"sp1","timestamp":"2023-01-01T12:00:00Z","rcpt_meta":{"notifuse_message_id":"msg_1"}}}}`
+	sparkPostSecond := `{"msys":{"message_event":{"type":"bounce","rcpt_to":"second@example.com","message_id":"sp2","timestamp":"2023-01-01T12:00:00Z","bounce_class":"10"}}}`
+	mailjetFirst := `{"event":"sent","time":1672574400,"MessageID":1,"email":"first@example.com"}`
+	mailjetSecond := `{"event":"bounce","time":1672574400,"MessageID":2,"email":"second@example.com","hard_bounce":true}`
+
+	cases := []struct {
+		name    string
+		process func(string, []byte) ([]*domain.InboundWebhookEvent, error)
+		first   string
+		second  string
+	}{
+		{"SendGrid", service.processSendGridWebhook, sendGridFirst, sendGridSecond},
+		{"SparkPost", service.processSparkPostWebhook, sparkPostFirst, sparkPostSecond},
+		{"Mailjet grouped events", service.processMailjetWebhook, mailjetFirst, mailjetSecond},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			batch := []byte("[\n  " + tc.first + ",\n  " + tc.second + "\n]")
+
+			events, err := tc.process(integrationID, batch)
+
+			require.NoError(t, err)
+			require.Len(t, events, 2)
+			assert.Equal(t, "first@example.com", events[0].RecipientEmail)
+			assert.JSONEq(t, tc.first, events[0].RawPayload)
+			assert.NotContains(t, events[0].RawPayload, "second@example.com")
+			assert.Equal(t, "second@example.com", events[1].RecipientEmail)
+			assert.JSONEq(t, tc.second, events[1].RawPayload)
+			assert.NotContains(t, events[1].RawPayload, "first@example.com")
+		})
+	}
+
+	t.Run("a single Mailjet event keeps the whole body", func(t *testing.T) {
+		events, err := service.processMailjetWebhook(integrationID, []byte(mailjetFirst))
+
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		assert.Equal(t, mailjetFirst, events[0].RawPayload)
+	})
+
+	t.Run("a null SparkPost element fails the batch without a panic", func(t *testing.T) {
+		events, err := service.processSparkPostWebhook(integrationID, []byte("["+sparkPostFirst+",null]"))
+
+		require.Error(t, err)
+		assert.Nil(t, events)
+	})
+
+	t.Run("a malformed element fails the batch", func(t *testing.T) {
+		for name, process := range map[string]func(string, []byte) ([]*domain.InboundWebhookEvent, error){
+			"SendGrid":  service.processSendGridWebhook,
+			"SparkPost": service.processSparkPostWebhook,
+			"Mailjet":   service.processMailjetWebhook,
+		} {
+			t.Run(name, func(t *testing.T) {
+				events, err := process(integrationID, []byte(`[{"timestamp":"not a number","time":"not a number","msys":"not an object"}]`))
+
+				require.Error(t, err)
+				assert.Nil(t, events)
+			})
+		}
 	})
 }

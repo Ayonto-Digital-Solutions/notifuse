@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 
@@ -81,7 +82,7 @@ func TestAutomationService_Create(t *testing.T) {
 	mockAuthService := mocks.NewMockAuthService(ctrl)
 	mockLogger := pkgmocks.NewMockLogger(ctrl)
 
-	service := NewAutomationService(mockRepo, mockAuthService, mockLogger)
+	service := NewAutomationService(mockRepo, mockAuthService, mockLogger, false)
 
 	ctx := context.Background()
 	workspaceID := "workspace-123"
@@ -156,7 +157,7 @@ func TestAutomationService_Get(t *testing.T) {
 	mockAuthService := mocks.NewMockAuthService(ctrl)
 	mockLogger := pkgmocks.NewMockLogger(ctrl)
 
-	service := NewAutomationService(mockRepo, mockAuthService, mockLogger)
+	service := NewAutomationService(mockRepo, mockAuthService, mockLogger, false)
 
 	ctx := context.Background()
 	workspaceID := "workspace-123"
@@ -212,7 +213,7 @@ func TestAutomationService_List(t *testing.T) {
 	mockAuthService := mocks.NewMockAuthService(ctrl)
 	mockLogger := pkgmocks.NewMockLogger(ctrl)
 
-	service := NewAutomationService(mockRepo, mockAuthService, mockLogger)
+	service := NewAutomationService(mockRepo, mockAuthService, mockLogger, false)
 
 	ctx := context.Background()
 	workspaceID := "workspace-123"
@@ -259,7 +260,7 @@ func TestAutomationService_Update(t *testing.T) {
 	mockAuthService := mocks.NewMockAuthService(ctrl)
 	mockLogger := pkgmocks.NewMockLogger(ctrl)
 
-	service := NewAutomationService(mockRepo, mockAuthService, mockLogger)
+	service := NewAutomationService(mockRepo, mockAuthService, mockLogger, false)
 
 	ctx := context.Background()
 	workspaceID := "workspace-123"
@@ -436,7 +437,10 @@ func TestAutomationService_Update(t *testing.T) {
 			mockRepo.EXPECT().CreateAutomationTrigger(ctx, workspaceID, automation).
 				Return(domain.NewTriggerConditionError("invalid trigger conditions: nope")),
 			// Detached context: the restore must not be cancelled by the request that failed.
-			mockRepo.EXPECT().Update(gomock.Not(gomock.Eq(ctx)), workspaceID, stored).Return(nil),
+			// Through the status predicate and the list check, like any write that leaves the
+			// automation live (TestAutomationService_Update_RestoreAfterFailedTrigger).
+			mockRepo.EXPECT().UpdateIfStatus(gomock.Not(gomock.Eq(ctx)), workspaceID, stored, domain.AutomationStatusLive).
+				Return(true, nil),
 		)
 
 		err := service.Update(ctx, workspaceID, automation)
@@ -553,9 +557,10 @@ func TestAutomationService_Update(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	// The one case the compensating write cannot fix. It leaves the stored configuration
-	// describing an automation the installed trigger does not implement, which nothing
-	// detects on its own — so it has to be logged rather than swallowed.
+	// The one case the undo cannot fix: the previous version can be written back neither live
+	// nor paused. It leaves the stored configuration describing an automation the installed
+	// trigger does not implement, which nothing detects on its own — so it has to be logged
+	// rather than swallowed, and the caller told.
 	t.Run("a failed restore after a failed trigger install is reported", func(t *testing.T) {
 		automation := createTestAutomationService("auto-123", workspaceID)
 		automation.Status = domain.AutomationStatusLive
@@ -576,7 +581,11 @@ func TestAutomationService_Update(t *testing.T) {
 			mockRepo.EXPECT().UpdateIfStatus(ctx, workspaceID, automation, stored.Status).Return(true, nil),
 			mockRepo.EXPECT().CreateAutomationTrigger(ctx, workspaceID, automation).
 				Return(domain.NewTriggerConditionError("invalid trigger conditions: column does not exist")),
-			mockRepo.EXPECT().Update(gomock.Not(gomock.Eq(ctx)), workspaceID, stored).Return(errors.New("db gone")),
+			mockRepo.EXPECT().UpdateIfStatus(gomock.Not(gomock.Eq(ctx)), workspaceID, stored, domain.AutomationStatusLive).
+				Return(false, errors.New("db gone")),
+			// Then paused instead, which fails the same way.
+			mockRepo.EXPECT().UpdateIfStatus(gomock.Not(gomock.Eq(ctx)), workspaceID, gomock.Not(gomock.Eq(stored)), domain.AutomationStatusLive).
+				Return(false, errors.New("db gone")),
 		)
 		// Both fields: with one database per workspace, the automation id alone does not
 		// say which database holds the mismatched trigger.
@@ -590,6 +599,8 @@ func TestAutomationService_Update(t *testing.T) {
 
 		var conditionErr *domain.TriggerConditionError
 		assert.True(t, errors.As(err, &conditionErr), "the condition error must survive wrapping so the handler can answer 400")
+		var undoFailed *domain.AutomationUndoFailedError
+		assert.True(t, errors.As(err, &undoFailed), "the caller must be told what the automation runs: got %v", err)
 	})
 }
 
@@ -597,6 +608,166 @@ func TestAutomationService_Update(t *testing.T) {
 // tests can express a key the caller never sent. A Go literal cannot: Nodes is a plain
 // slice on a struct with no optional fields, so "not part of this edit" and "delete every
 // node" are the same value once it is built by hand.
+// TestAutomationService_WebhookNodeTargets covers the save-time half of the guard on
+// webhook nodes: a URL that names an internal target is refused when it is saved,
+// with a ValidationError the handlers answer as 400. The dial-time half, which is
+// what actually protects the request, is TestWebhookNodeExecutor_Execute_RefusesAPrivateTarget.
+func TestAutomationService_WebhookNodeTargets(t *testing.T) {
+	const workspaceID = "workspace-123"
+
+	newService := func(t *testing.T, allowPrivateWebhookHosts bool) (*AutomationService, *mocks.MockAutomationRepository, context.Context) {
+		t.Helper()
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+		repo := mocks.NewMockAutomationRepository(ctrl)
+		auth := mocks.NewMockAuthService(ctrl)
+		ctx := context.Background()
+		auth.EXPECT().AuthenticateUserForWorkspace(gomock.Any(), workspaceID).
+			Return(ctx, &domain.User{}, automationTransitionUserWorkspace(workspaceID), nil).AnyTimes()
+		return NewAutomationService(repo, auth, pkgmocks.NewMockLogger(ctrl), allowPrivateWebhookHosts), repo, ctx
+	}
+
+	// createTestAutomationService names "node-root" as the root, so the trigger
+	// carries that ID; otherwise Validate refuses the automation before the
+	// webhook check is ever reached.
+	withNode := func(nodeType domain.NodeType, url interface{}) *domain.Automation {
+		automation := createTestAutomationService("auto-123", workspaceID)
+		trigger := createTestAutomationNodeService("node-root", automation.ID, domain.NodeTypeTrigger)
+		trigger.NextNodeID = strPtr("node-hook")
+		node := createTestAutomationNodeService("node-hook", automation.ID, nodeType)
+		node.Config = map[string]interface{}{"url": url}
+		automation.Nodes = []*domain.AutomationNode{trigger, node}
+		return automation
+	}
+
+	t.Run("create refuses a URL that names an internal target", func(t *testing.T) {
+		for _, tc := range []struct{ name, url string }{
+			{"loopback", "http://127.0.0.1:8080/hook"},
+			{"IPv6 loopback", "http://[::1]/hook"},
+			{"cloud metadata", "http://169.254.169.254/latest/meta-data/"},
+			{"RFC1918", "http://10.0.0.5/hook"},
+			{"localhost by name", "http://localhost:3000/hook"},
+			{"kubernetes cluster domain", "http://svc.default.svc.cluster.local/hook"},
+			{"localhost with a trailing dot", "http://localhost./hook"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				service, _, ctx := newService(t, false)
+
+				// No repo.Create expectation: gomock fails the test if it is called.
+				err := service.Create(ctx, workspaceID, withNode(domain.NodeTypeWebhook, tc.url))
+
+				var validationErr domain.ValidationError
+				require.True(t, errors.As(err, &validationErr), "want a ValidationError, got %v", err)
+				assert.Contains(t, validationErr.Message, "node-hook", "the message names the node")
+				assert.Contains(t, validationErr.Message, "WEBHOOK_DELIVERY_ALLOW_PRIVATE_HOSTS", "and how to opt out")
+			})
+		}
+	})
+
+	// A single-label name is how a container addresses a sibling: it is decided at
+	// dial time, like everything that resolves privately. An empty or non-string
+	// URL is an unfinished draft, left to fail at run time as it always has.
+	t.Run("create accepts what does not name an internal target", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			url  interface{}
+		}{
+			{"public receiver with a token query", "https://hooks.example.com/notifuse?token=abc123"},
+			{"unconfigured draft", ""},
+			{"docker sibling by name", "http://n8n:5678/webhook"},
+			{"non-string url", 42},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				service, repo, ctx := newService(t, false)
+				automation := withNode(domain.NodeTypeWebhook, tc.url)
+				repo.EXPECT().Create(ctx, workspaceID, automation).Return(nil)
+
+				assert.NoError(t, service.Create(ctx, workspaceID, automation))
+			})
+		}
+	})
+
+	t.Run("create accepts an internal target when the deployment opts out", func(t *testing.T) {
+		service, repo, ctx := newService(t, true)
+		automation := withNode(domain.NodeTypeWebhook, "http://127.0.0.1:8080/hook")
+		repo.EXPECT().Create(ctx, workspaceID, automation).Return(nil)
+
+		assert.NoError(t, service.Create(ctx, workspaceID, automation))
+	})
+
+	t.Run("create ignores a url key on a node that is not a webhook", func(t *testing.T) {
+		service, repo, ctx := newService(t, false)
+		automation := withNode(domain.NodeTypeAddToList, "http://127.0.0.1/")
+		repo.EXPECT().Create(ctx, workspaceID, automation).Return(nil)
+
+		assert.NoError(t, service.Create(ctx, workspaceID, automation))
+	})
+
+	t.Run("update refuses an internal target among the nodes it carries", func(t *testing.T) {
+		service, _, ctx := newService(t, false)
+		req := decodeUpdateAutomationRequest(t, `{
+			"workspace_id": "workspace-123",
+			"automation": {
+				"id": "auto-123",
+				"workspace_id": "workspace-123",
+				"name": "Pointed inward",
+				"status": "draft",
+				"list_id": "list-123",
+				"trigger": {"event_kind": "email.opened", "frequency": "once"},
+				"root_node_id": "node-root",
+				"nodes": [
+					{"id": "node-root", "automation_id": "auto-123", "type": "trigger", "config": {}, "next_node_id": "node-hook"},
+					{"id": "node-hook", "automation_id": "auto-123", "type": "webhook", "config": {"url": "http://10.0.0.5/hook"}}
+				]
+			}
+		}`)
+		require.NoError(t, req.Validate())
+
+		// No GetByID or UpdateIfStatus expectation: the check runs before the stored
+		// row is read, so gomock fails the test if either is called.
+		err := service.Update(ctx, workspaceID, req.Automation)
+
+		var validationErr domain.ValidationError
+		require.True(t, errors.As(err, &validationErr), "want a ValidationError, got %v", err)
+		assert.Contains(t, validationErr.Message, "node-hook")
+	})
+
+	// A rename that leaves the workflow out keeps the stored nodes, and must not be
+	// refused for a URL saved before the guard existed: the dial-time guard is what
+	// stops that one, and blocking the rename would protect nothing.
+	t.Run("update that omits nodes does not re-check the stored workflow", func(t *testing.T) {
+		service, repo, ctx := newService(t, false)
+		req := decodeUpdateAutomationRequest(t, `{
+			"workspace_id": "workspace-123",
+			"automation": {
+				"id": "auto-123",
+				"workspace_id": "workspace-123",
+				"name": "Renamed",
+				"status": "draft",
+				"list_id": "list-123",
+				"trigger": {"event_kind": "email.opened", "frequency": "once"}
+			}
+		}`)
+		require.Nil(t, req.Automation.Nodes, "the request must carry no nodes, or this proves nothing")
+
+		repo.EXPECT().GetByID(ctx, workspaceID, "auto-123").Return(withNode(domain.NodeTypeWebhook, "http://10.0.0.5/hook"), nil)
+		var persisted *domain.Automation
+		repo.EXPECT().
+			UpdateIfStatus(ctx, workspaceID, gomock.Any(), domain.AutomationStatusDraft).
+			DoAndReturn(func(_ context.Context, _ string, a *domain.Automation, _ domain.AutomationStatus) (bool, error) {
+				persisted = a
+				return true, nil
+			})
+
+		require.NoError(t, service.Update(ctx, workspaceID, req.Automation))
+
+		require.NotNil(t, persisted)
+		require.Len(t, persisted.Nodes, 2)
+		assert.Equal(t, "http://10.0.0.5/hook", persisted.Nodes[1].Config["url"])
+		assert.Equal(t, "Renamed", persisted.Name)
+	})
+}
+
 func decodeUpdateAutomationRequest(t *testing.T, body string) *domain.UpdateAutomationRequest {
 	t.Helper()
 	var req domain.UpdateAutomationRequest
@@ -617,7 +788,7 @@ func TestAutomationService_Update_OmittedNodesKeepTheStoredWorkflow(t *testing.T
 	mockAuthService := mocks.NewMockAuthService(ctrl)
 	mockLogger := pkgmocks.NewMockLogger(ctrl)
 
-	service := NewAutomationService(mockRepo, mockAuthService, mockLogger)
+	service := NewAutomationService(mockRepo, mockAuthService, mockLogger, false)
 
 	ctx := context.Background()
 	workspaceID := "workspace-123"
@@ -754,7 +925,7 @@ func TestAutomationService_Delete(t *testing.T) {
 	mockAuthService := mocks.NewMockAuthService(ctrl)
 	mockLogger := pkgmocks.NewMockLogger(ctrl)
 
-	service := NewAutomationService(mockRepo, mockAuthService, mockLogger)
+	service := NewAutomationService(mockRepo, mockAuthService, mockLogger, false)
 
 	ctx := context.Background()
 	workspaceID := "workspace-123"
@@ -826,7 +997,7 @@ func TestAutomationService_Activate(t *testing.T) {
 	mockAuthService := mocks.NewMockAuthService(ctrl)
 	mockLogger := pkgmocks.NewMockLogger(ctrl)
 
-	service := NewAutomationService(mockRepo, mockAuthService, mockLogger)
+	service := NewAutomationService(mockRepo, mockAuthService, mockLogger, false)
 
 	ctx := context.Background()
 	workspaceID := "workspace-123"
@@ -1090,7 +1261,7 @@ func TestAutomationService_Pause(t *testing.T) {
 	mockAuthService := mocks.NewMockAuthService(ctrl)
 	mockLogger := pkgmocks.NewMockLogger(ctrl)
 
-	service := NewAutomationService(mockRepo, mockAuthService, mockLogger)
+	service := NewAutomationService(mockRepo, mockAuthService, mockLogger, false)
 
 	ctx := context.Background()
 	workspaceID := "workspace-123"
@@ -1144,7 +1315,7 @@ func TestAutomationService_GetContactNodeExecutions(t *testing.T) {
 	mockAuthService := mocks.NewMockAuthService(ctrl)
 	mockLogger := pkgmocks.NewMockLogger(ctrl)
 
-	service := NewAutomationService(mockRepo, mockAuthService, mockLogger)
+	service := NewAutomationService(mockRepo, mockAuthService, mockLogger, false)
 
 	ctx := context.Background()
 	workspaceID := "workspace-123"
@@ -1221,7 +1392,7 @@ func newAutomationTransitionMocks(t *testing.T) (*AutomationService, *mocks.Mock
 	repo := mocks.NewMockAutomationRepository(ctrl)
 	auth := mocks.NewMockAuthService(ctrl)
 	log := pkgmocks.NewMockLogger(ctrl)
-	return NewAutomationService(repo, auth, log), repo, auth, log
+	return NewAutomationService(repo, auth, log, false), repo, auth, log
 }
 
 func automationTransitionUserWorkspace(workspaceID string) *domain.UserWorkspace {
@@ -1428,6 +1599,367 @@ func TestAutomationService_TransitionsRejectStaleStatus(t *testing.T) {
 	})
 }
 
+// A write that would leave an automation live is refused by the repository when a list it
+// requires is deleted. The refusal reaches the handler as itself, and nothing that follows a
+// successful write runs: no trigger is installed or regenerated, and no compensating write
+// puts anything back, because nothing was written.
+func TestAutomationService_DeletedListRefusals(t *testing.T) {
+	workspaceID := "workspace-123"
+	automationID := "auto-123"
+
+	refusal := domain.NewAutomationDeletedListError(automationID, []domain.ListRef{{ID: "list-123", Name: "Newsletter"}})
+
+	sendsEmail := func(status domain.AutomationStatus) *domain.Automation {
+		automation := createTestAutomationService(automationID, workspaceID)
+		automation.Status = status
+		automation.RootNodeID = "node-email"
+		automation.Nodes = []*domain.AutomationNode{{
+			ID: "node-email", AutomationID: automationID, Type: domain.NodeTypeEmail,
+			Config: map[string]interface{}{"template_id": "tpl"},
+		}}
+		return automation
+	}
+
+	assertRefused := func(t *testing.T, err error) {
+		t.Helper()
+		var target *domain.AutomationDeletedListError
+		require.True(t, errors.As(err, &target), "the refusal must survive wrapping so the handler can answer 400: %v", err)
+		assert.Same(t, refusal, target)
+	}
+
+	for _, previous := range []domain.AutomationStatus{domain.AutomationStatusPaused, domain.AutomationStatusDraft} {
+		t.Run("activating a "+string(previous)+" automation installs no trigger", func(t *testing.T) {
+			svc, repo, auth, _ := newAutomationTransitionMocks(t)
+			ctx := context.Background()
+
+			stored := sendsEmail(previous)
+			auth.EXPECT().AuthenticateUserForWorkspace(gomock.Any(), workspaceID).
+				Return(ctx, &domain.User{}, automationTransitionUserWorkspace(workspaceID), nil)
+			repo.EXPECT().GetByID(ctx, workspaceID, automationID).Return(stored, nil)
+			repo.EXPECT().UpdateIfStatus(ctx, workspaceID, gomock.Any(), previous).
+				DoAndReturn(func(_ context.Context, _ string, written *domain.Automation, _ domain.AutomationStatus) (bool, error) {
+					// The repository checks the lists of a write that leaves the automation
+					// live, so this one has to say live.
+					assert.Equal(t, domain.AutomationStatusLive, written.Status)
+					return false, refusal
+				})
+			repo.EXPECT().CreateAutomationTrigger(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			repo.EXPECT().Update(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+			assertRefused(t, svc.Activate(ctx, workspaceID, automationID))
+		})
+	}
+
+	t.Run("changing a live automation regenerates no trigger and restores nothing", func(t *testing.T) {
+		svc, repo, auth, log := newAutomationTransitionMocks(t)
+		ctx := context.Background()
+
+		stored := sendsEmail(domain.AutomationStatusLive)
+		// A changed trigger: what makes a successful update regenerate the installed one.
+		changed := sendsEmail(domain.AutomationStatusDraft)
+		changed.Trigger.Conditions = testTriggerConditionsService("country", "US")
+
+		auth.EXPECT().AuthenticateUserForWorkspace(gomock.Any(), workspaceID).
+			Return(ctx, &domain.User{}, automationTransitionUserWorkspace(workspaceID), nil)
+		repo.EXPECT().GetByID(ctx, workspaceID, automationID).Return(stored, nil)
+		repo.EXPECT().UpdateIfStatus(ctx, workspaceID, gomock.Any(), domain.AutomationStatusLive).
+			DoAndReturn(func(_ context.Context, _ string, written *domain.Automation, _ domain.AutomationStatus) (bool, error) {
+				assert.Equal(t, domain.AutomationStatusLive, written.Status, "an update keeps the stored status")
+				return false, refusal
+			})
+		// Not logged as an error: the caller's configuration is what is wrong, and the answer
+		// tells them so.
+		log.EXPECT().Error(gomock.Any()).Times(0)
+		repo.EXPECT().CreateAutomationTrigger(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+		repo.EXPECT().Update(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+		assertRefused(t, svc.Update(ctx, workspaceID, changed))
+	})
+}
+
+// An update to a live automation writes the row, then installs the trigger compiled from it.
+// When the install fails, the previous trigger is still the one installed, and the row is put
+// back to the version that trigger implements.
+//
+// Put back through the checks of any write that leaves an automation live, the previous version
+// can be refused: a list it uses is deleted, meanwhile or from before the update, or does not
+// exist. Then, and when it cannot be written back live for any other reason, the automation goes
+// back paused, its trigger dropped, and the caller is told: answered with the failure alone, they
+// would save again and take the success for an automation still live. When it cannot be written
+// back paused either, the caller is told what the automation runs instead, and the audit row of
+// the failed update records what it changed, either way.
+func TestAutomationService_Update_UndoAfterFailedTrigger(t *testing.T) {
+	workspaceID := "workspace-123"
+	automationID := "auto-123"
+
+	installErr := domain.NewTriggerConditionError("invalid trigger conditions: operator does not exist")
+	deletedList := domain.NewAutomationDeletedListError(automationID, []domain.ListRef{{ID: "list-old", Name: "Old"}})
+
+	type failedUpdate struct {
+		svc      *AutomationService
+		repo     *mocks.MockAutomationRepository
+		log      *pkgmocks.MockLogger
+		ctx      context.Context
+		audit    *domain.AuditRecord
+		previous *domain.Automation
+		changed  *domain.Automation
+		install  *gomock.Call
+		// restoreGaveUp is when the restore returned, the earliest the paused write's budget may
+		// start from.
+		restoreGaveUp time.Time
+	}
+
+	// detached checks the context a step of the undo runs on. The request context is cancelled
+	// by then, and so would be any context derived from it.
+	detached := func(t *testing.T, ctx context.Context) {
+		t.Helper()
+		assert.NoError(t, ctx.Err(), "the undo must run on neither the request context nor one derived from it")
+	}
+
+	// budget checks that a step of the undo is given about d from when it starts, and returns the
+	// deadline.
+	budget := func(t *testing.T, ctx context.Context, d time.Duration) time.Time {
+		t.Helper()
+		deadline, ok := ctx.Deadline()
+		require.True(t, ok, "every step of the undo is bounded")
+		assert.WithinDuration(t, time.Now().Add(d), deadline, time.Second)
+		return deadline
+	}
+
+	// expectFailedUpdate expects the update itself, of a live automation that sends email to its
+	// own list: the row written with another list and another trigger, then the install of that
+	// trigger, which fails as the caller gives up waiting for it.
+	expectFailedUpdate := func(t *testing.T) *failedUpdate {
+		t.Helper()
+		svc, repo, auth, log := newAutomationTransitionMocks(t)
+		// The record the audit middleware puts on every request it logs.
+		audit := domain.NewAuditRecord("", "", "")
+		reqCtx, cancel := context.WithCancel(domain.WithAuditRecord(context.Background(), audit))
+		t.Cleanup(cancel)
+		u := &failedUpdate{svc: svc, repo: repo, log: log, ctx: reqCtx, audit: audit}
+
+		emailNode := func() []*domain.AutomationNode {
+			return []*domain.AutomationNode{{
+				ID: "node-email", AutomationID: automationID, Type: domain.NodeTypeEmail,
+				Config: map[string]interface{}{"template_id": "tpl"},
+			}}
+		}
+		u.previous = createTestAutomationService(automationID, workspaceID)
+		u.previous.Status = domain.AutomationStatusLive
+		u.previous.ListID = "list-old"
+		u.previous.RootNodeID = "node-email"
+		u.previous.Nodes = emailNode()
+
+		u.changed = createTestAutomationService(automationID, workspaceID)
+		u.changed.ListID = "list-new"
+		u.changed.RootNodeID = "node-email"
+		u.changed.Nodes = emailNode()
+		u.changed.Trigger.Conditions = testTriggerConditionsService("country", "US")
+
+		auth.EXPECT().AuthenticateUserForWorkspace(gomock.Any(), workspaceID).
+			Return(u.ctx, &domain.User{}, automationTransitionUserWorkspace(workspaceID), nil)
+		repo.EXPECT().GetByID(u.ctx, workspaceID, automationID).Return(u.previous, nil)
+		written := repo.EXPECT().UpdateIfStatus(u.ctx, workspaceID, u.changed, domain.AutomationStatusLive).Return(true, nil)
+		u.install = repo.EXPECT().CreateAutomationTrigger(u.ctx, workspaceID, u.changed).
+			DoAndReturn(func(context.Context, string, *domain.Automation) error {
+				cancel()
+				return installErr
+			}).After(written)
+		return u
+	}
+
+	// expectRestore expects the previous version written back live, through the status predicate
+	// and the list check.
+	expectRestore := func(t *testing.T, u *failedUpdate, updated bool, err error) *gomock.Call {
+		return u.repo.EXPECT().UpdateIfStatus(gomock.Any(), workspaceID, u.previous, domain.AutomationStatusLive).
+			DoAndReturn(func(ctx context.Context, _ string, _ *domain.Automation, _ domain.AutomationStatus) (bool, error) {
+				detached(t, ctx)
+				budget(t, ctx, 5*time.Second)
+				// Long enough for a budget started with the restore's to fall visibly short.
+				time.Sleep(20 * time.Millisecond)
+				u.restoreGaveUp = time.Now()
+				return updated, err
+			}).After(u.install)
+	}
+
+	// expectPausedWrite expects the previous version written back paused instead: still through
+	// the status predicate, so a transition that landed meanwhile is left alone, and on a budget
+	// of its own, since the restore can have spent all of its own waiting for a list.
+	expectPausedWrite := func(t *testing.T, u *failedUpdate, after *gomock.Call, updated bool, err error) *gomock.Call {
+		return u.repo.EXPECT().UpdateIfStatus(gomock.Any(), workspaceID, gomock.Not(gomock.Eq(u.previous)), domain.AutomationStatusLive).
+			DoAndReturn(func(ctx context.Context, _ string, written *domain.Automation, _ domain.AutomationStatus) (bool, error) {
+				detached(t, ctx)
+				// Counted from when the restore gave up, not from when it started.
+				assert.False(t, budget(t, ctx, 5*time.Second).Before(u.restoreGaveUp.Add(5*time.Second)),
+					"the paused write's budget must start once the restore has given up")
+				assert.Equal(t, domain.AutomationStatusPaused, written.Status)
+				assert.Equal(t, "list-old", written.ListID, "the previous version, not the one that failed")
+				assert.Equal(t, u.previous.Trigger, written.Trigger)
+				return updated, err
+			}).After(after)
+	}
+
+	// expectDrop expects the trigger the failed install left in place to be dropped, waiting for
+	// contact_timeline no longer than that install did. Its budget outlasts that wait, so the lock
+	// timeout, not the context, is what ends it.
+	expectDrop := func(t *testing.T, u *failedUpdate, after *gomock.Call, err error) {
+		u.repo.EXPECT().DropAutomationTriggerWithLockTimeout(gomock.Any(), workspaceID, automationID).
+			DoAndReturn(func(ctx context.Context, _, _ string) error {
+				detached(t, ctx)
+				budget(t, ctx, 10*time.Second)
+				return err
+			}).After(after)
+	}
+
+	// With the workspace, since each one is its own database.
+	expectLogFields := func(u *failedUpdate) {
+		u.log.EXPECT().WithField("automation_id", automationID).Return(u.log)
+		u.log.EXPECT().WithField("workspace_id", workspaceID).Return(u.log)
+	}
+
+	// The caller is told why their change failed, which is not the list.
+	assertInstallError := func(t *testing.T, err error) {
+		t.Helper()
+		var conditionErr *domain.TriggerConditionError
+		require.True(t, errors.As(err, &conditionErr), "got %v", err)
+		var listErr *domain.AutomationDeletedListError
+		assert.False(t, errors.As(err, &listErr))
+	}
+
+	// auditMetadata is what the audit row of the update records beyond the request itself. The
+	// audit middleware writes the row once the handler has answered, as this does.
+	auditMetadata := func(u *failedUpdate) map[string]any {
+		event, _ := u.audit.Finalize(http.StatusInternalServerError)
+		return event.Metadata
+	}
+
+	// assertPaused checks the caller is also told that the automation was paused, and why, and
+	// that the audit row of the failed update records the pause.
+	assertPaused := func(t *testing.T, u *failedUpdate, err error, lists []domain.ListRef) {
+		t.Helper()
+		assertInstallError(t, err)
+		var paused *domain.AutomationPausedError
+		require.True(t, errors.As(err, &paused), "the caller must be told of the pause: got %v", err)
+		assert.Equal(t, automationID, paused.AutomationID)
+		assert.Equal(t, lists, paused.Lists)
+		var undoFailed *domain.AutomationUndoFailedError
+		assert.False(t, errors.As(err, &undoFailed), "got %v", err)
+		metadata := auditMetadata(u)
+		assert.Equal(t, true, metadata["paused"])
+		assert.NotContains(t, metadata, "running_previous_trigger")
+	}
+
+	// assertNotPaused checks the caller is told of the failure alone, and nothing more is audited:
+	// the update changed nothing that lasts.
+	assertNotPaused := func(t *testing.T, u *failedUpdate, err error) {
+		t.Helper()
+		assertInstallError(t, err)
+		var paused *domain.AutomationPausedError
+		assert.False(t, errors.As(err, &paused), "got %v", err)
+		var undoFailed *domain.AutomationUndoFailedError
+		assert.False(t, errors.As(err, &undoFailed), "got %v", err)
+		metadata := auditMetadata(u)
+		assert.NotContains(t, metadata, "paused")
+		assert.NotContains(t, metadata, "running_previous_trigger")
+	}
+
+	// assertUndoFailed checks the caller is told that the automation is still live on the version
+	// the update stored, running the trigger of the previous one, and that the audit row records it.
+	assertUndoFailed := func(t *testing.T, u *failedUpdate, err error) {
+		t.Helper()
+		assertInstallError(t, err)
+		var undoFailed *domain.AutomationUndoFailedError
+		require.True(t, errors.As(err, &undoFailed), "the caller must be told what the automation runs: got %v", err)
+		assert.Equal(t, automationID, undoFailed.AutomationID)
+		var paused *domain.AutomationPausedError
+		assert.False(t, errors.As(err, &paused), "got %v", err)
+		metadata := auditMetadata(u)
+		assert.Equal(t, true, metadata["running_previous_trigger"])
+		assert.NotContains(t, metadata, "paused")
+	}
+
+	t.Run("a list the previous version uses is deleted: paused, its trigger dropped, the caller told", func(t *testing.T) {
+		u := expectFailedUpdate(t)
+		paused := expectPausedWrite(t, u, expectRestore(t, u, false, deletedList), true, nil)
+		expectDrop(t, u, paused, nil)
+		expectLogFields(u)
+		// In the refusal's own words, which name the list and tell a deleted one from one that
+		// does not exist.
+		u.log.EXPECT().Warn(gomock.Any()).Do(func(msg string) {
+			assert.Contains(t, msg, deletedList.Error())
+		})
+
+		assertPaused(t, u, u.svc.Update(u.ctx, workspaceID, u.changed), deletedList.Lists)
+	})
+
+	// The list check locks the previous version's lists, and a deletion in progress holds one
+	// for as long as it takes to remove every member, so the restore can spend its whole budget
+	// waiting. Left at that, the row would describe the failed version, live, on the previous
+	// version's trigger, and the next save would not reinstall it: to that save, nothing it
+	// compiles from has changed.
+	t.Run("the previous version cannot be written back: paused all the same, the caller told", func(t *testing.T) {
+		u := expectFailedUpdate(t)
+		paused := expectPausedWrite(t, u, expectRestore(t, u, false, context.DeadlineExceeded), true, nil)
+		expectDrop(t, u, paused, nil)
+		expectLogFields(u)
+		u.log.EXPECT().Warn(gomock.Any()).Do(func(msg string) {
+			assert.Contains(t, msg, context.DeadlineExceeded.Error())
+		})
+
+		assertPaused(t, u, u.svc.Update(u.ctx, workspaceID, u.changed), nil)
+	})
+
+	t.Run("the previous version is put back: nothing more to do", func(t *testing.T) {
+		u := expectFailedUpdate(t)
+		expectRestore(t, u, true, nil)
+
+		assertNotPaused(t, u, u.svc.Update(u.ctx, workspaceID, u.changed))
+	})
+
+	// Written unconditionally, the previous version would revert a pause to live, and the trigger
+	// that pause dropped would never come back: a live automation that enrols nobody.
+	t.Run("another transition got there first: the automation is left as it left it", func(t *testing.T) {
+		u := expectFailedUpdate(t)
+		expectRestore(t, u, false, nil)
+
+		assertNotPaused(t, u, u.svc.Update(u.ctx, workspaceID, u.changed))
+	})
+
+	// The transition that landed decides what becomes of the trigger: no warning, no drop, and
+	// no pause to report.
+	t.Run("another transition got there before the paused write: the automation is left as it left it", func(t *testing.T) {
+		u := expectFailedUpdate(t)
+		expectPausedWrite(t, u, expectRestore(t, u, false, deletedList), false, nil)
+
+		assertNotPaused(t, u, u.svc.Update(u.ctx, workspaceID, u.changed))
+	})
+
+	// The automation is left live on the version the update stored, running the trigger of the
+	// previous one, and saving that version again would not reinstall it: to that save, nothing
+	// the trigger compiles from has changed. Logged, and the caller told how to repair it.
+	t.Run("the previous version cannot be written back paused either: the caller told what the automation runs", func(t *testing.T) {
+		u := expectFailedUpdate(t)
+		expectPausedWrite(t, u, expectRestore(t, u, false, deletedList), false, errors.New("db gone"))
+		expectLogFields(u)
+		u.log.EXPECT().Error(gomock.Any())
+
+		assertUndoFailed(t, u, u.svc.Update(u.ctx, workspaceID, u.changed))
+	})
+
+	// Inert meanwhile — automation_enroll_contact enrols nobody into a paused automation — but
+	// left installed, so it has to be said. The automation is paused all the same.
+	t.Run("the trigger left in place cannot be dropped: reported", func(t *testing.T) {
+		u := expectFailedUpdate(t)
+		paused := expectPausedWrite(t, u, expectRestore(t, u, false, deletedList), true, nil)
+		expectDrop(t, u, paused, errors.New("lock timeout"))
+		expectLogFields(u)
+		u.log.EXPECT().Warn(gomock.Any())
+		u.log.EXPECT().Error(gomock.Any())
+
+		assertPaused(t, u, u.svc.Update(u.ctx, workspaceID, u.changed), deletedList.Lists)
+	})
+}
+
 // TestAutomationService_Update_OmittedExitOnReplyKeepsTheStoredSetting covers a body that
 // says nothing about exit_on_reply. The field is a plain bool and automations.update
 // rewrites the whole row, so an absent key decodes as false and switches the setting off —
@@ -1441,7 +1973,7 @@ func TestAutomationService_Update_OmittedExitOnReplyKeepsTheStoredSetting(t *tes
 	mockAuthService := mocks.NewMockAuthService(ctrl)
 	mockLogger := pkgmocks.NewMockLogger(ctrl)
 
-	service := NewAutomationService(mockRepo, mockAuthService, mockLogger)
+	service := NewAutomationService(mockRepo, mockAuthService, mockLogger, false)
 
 	ctx := context.Background()
 	workspaceID := "workspace-123"
@@ -1562,7 +2094,7 @@ func TestAutomationService_Update_OmittedListIDKeepsTheStoredList(t *testing.T) 
 	mockAuthService := mocks.NewMockAuthService(ctrl)
 	mockLogger := pkgmocks.NewMockLogger(ctrl)
 
-	service := NewAutomationService(mockRepo, mockAuthService, mockLogger)
+	service := NewAutomationService(mockRepo, mockAuthService, mockLogger, false)
 
 	ctx := context.Background()
 	workspaceID := "workspace-123"

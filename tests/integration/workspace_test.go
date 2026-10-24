@@ -7,10 +7,15 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Notifuse/notifuse/config"
+	"github.com/Notifuse/notifuse/internal/app"
+	intdb "github.com/Notifuse/notifuse/internal/database"
 	"github.com/Notifuse/notifuse/internal/domain"
 	"github.com/Notifuse/notifuse/tests/testutil"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -126,6 +131,123 @@ func TestWorkspaceCRUDSuite(t *testing.T) {
 			err = json.NewDecoder(resp2.Body).Decode(&errorResp)
 			require.NoError(t, err)
 			assert.Contains(t, errorResp["error"], "already exists")
+		})
+
+		// The name limit counts characters, as the console's counter does: 32 accented
+		// characters, over the limit in bytes, are accepted on create and update, a 33rd is refused.
+		t.Run("name length counted in characters", func(t *testing.T) {
+			workspaceID := "namelen" + uuid.New().String()[:8]
+			settings := domain.WorkspaceSettings{
+				Timezone:        "UTC",
+				DefaultLanguage: "en",
+				Languages:       []string{"en"},
+			}
+			storedName := func() string {
+				var name string
+				require.NoError(t, suite.DBManager.GetDB().QueryRow("SELECT name FROM workspaces WHERE id = $1", workspaceID).Scan(&name))
+				return name
+			}
+
+			name := strings.Repeat("é", 32)
+			require.Greater(t, len(name), 32, "the name must be over the limit in bytes")
+			resp, err := client.Post("/api/workspaces.create", domain.CreateWorkspaceRequest{ID: workspaceID, Name: name, Settings: settings})
+			require.NoError(t, err)
+			resp.Body.Close()
+			require.Equal(t, http.StatusCreated, resp.StatusCode)
+			assert.Equal(t, name, storedName())
+
+			renamed := strings.Repeat("à", 32)
+			resp, err = client.Post("/api/workspaces.update", domain.UpdateWorkspaceRequest{ID: workspaceID, Name: renamed, Settings: settings})
+			require.NoError(t, err)
+			resp.Body.Close()
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			assert.Equal(t, renamed, storedName())
+
+			resp, err = client.Post("/api/workspaces.update", domain.UpdateWorkspaceRequest{ID: workspaceID, Name: strings.Repeat("é", 33), Settings: settings})
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			var errorResp map[string]string
+			require.NoError(t, json.NewDecoder(resp.Body).Decode(&errorResp))
+			assert.Equal(t, "invalid update workspace request: name length must be between 1 and 32", errorResp["error"])
+			assert.Equal(t, renamed, storedName(), "a refused rename leaves the name as it was")
+		})
+
+		// The ID is stored in VARCHAR(20) columns: a longer one is refused with the reason
+		// instead of failing in the insert as a server error.
+		t.Run("workspace ID over 20 characters", func(t *testing.T) {
+			workspaceID := "toolong" + strings.ReplaceAll(uuid.New().String(), "-", "")[:14]
+			require.Len(t, workspaceID, 21)
+			createReq := domain.CreateWorkspaceRequest{
+				ID:   workspaceID,
+				Name: "Long ID Workspace",
+				Settings: domain.WorkspaceSettings{
+					Timezone:        "UTC",
+					DefaultLanguage: "en",
+					Languages:       []string{"en"},
+				},
+			}
+
+			resp, err := client.Post("/api/workspaces.create", createReq)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			var errorResp map[string]string
+			require.NoError(t, json.NewDecoder(resp.Body).Decode(&errorResp))
+			assert.Equal(t, "invalid create workspace request: id length must be between 1 and 20", errorResp["error"])
+
+			var count int
+			require.NoError(t, suite.DBManager.GetDB().QueryRow("SELECT COUNT(*) FROM workspaces WHERE id = $1", workspaceID).Scan(&count))
+			assert.Equal(t, 0, count)
+		})
+
+		t.Run("workspace ID with uppercase letters", func(t *testing.T) {
+			workspaceID := "Upper" + strings.ReplaceAll(uuid.New().String(), "-", "")[:10]
+			dropLeftoverDatabase(t, suite, wsDBName(suite.DBManager.GetConfig().Prefix, workspaceID))
+			createReq := domain.CreateWorkspaceRequest{
+				ID:   workspaceID,
+				Name: "Uppercase ID Workspace",
+				Settings: domain.WorkspaceSettings{
+					Timezone:        "UTC",
+					DefaultLanguage: "en",
+					Languages:       []string{"en"},
+				},
+			}
+
+			resp, err := client.Post("/api/workspaces.create", createReq)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			var errorResp map[string]string
+			require.NoError(t, json.NewDecoder(resp.Body).Decode(&errorResp))
+			assert.Equal(t, "invalid create workspace request: id must contain only lowercase letters and digits", errorResp["error"])
+
+			db := suite.DBManager.GetDB()
+			var count int
+			require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE id = $1", workspaceID).Scan(&count))
+			assert.Equal(t, 0, count)
+
+			// Compared without case: the database must not exist under any form of its name.
+			workspaceDBName := wsDBName(suite.DBManager.GetConfig().Prefix, workspaceID)
+			leftovers, err := databasesAnyCase(db, workspaceDBName)
+			require.NoError(t, err)
+			assert.Empty(t, leftovers, "no workspace database may be left behind")
+		})
+
+		t.Run("workspace database name with uppercase letters", func(t *testing.T) {
+			workspaceID := "Upper" + strings.ReplaceAll(uuid.New().String(), "-", "")[:10]
+			cfg := suite.DBManager.GetConfig()
+			workspaceDBName := wsDBName(cfg.Prefix, workspaceID)
+			dropLeftoverDatabase(t, suite, workspaceDBName)
+
+			err := intdb.EnsureWorkspaceDatabaseExists(cfg, workspaceID)
+			require.EqualError(t, err, "workspace database name must be lowercase: "+workspaceDBName)
+
+			leftovers, err := databasesAnyCase(suite.DBManager.GetDB(), workspaceDBName)
+			require.NoError(t, err)
+			assert.Empty(t, leftovers, "no workspace database may be left behind")
 		})
 
 		t.Run("invalid workspace data", func(t *testing.T) {
@@ -721,6 +843,84 @@ func TestWorkspaceMembershipSuite(t *testing.T) {
 			client.SetToken(ownerToken)
 		})
 
+		// Resending is a second inviteMember call for an email that already has a pending
+		// invitation — exactly what the console's "Resend invitation" button does. The upsert
+		// keeps the original row, so the link in the resent email has to name that row.
+		t.Run("resent invitation link can be verified and accepted", func(t *testing.T) {
+			client.SetToken(ownerToken)
+			defer client.SetToken(ownerToken)
+			inviteeEmail := "resent-invite-user@example.com"
+
+			invite := func() (token, invitationID string) {
+				resp, err := client.Post("/api/workspaces.inviteMember", map[string]interface{}{
+					"workspace_id": workspaceID,
+					"email":        inviteeEmail,
+					"permissions":  domain.NewFullPermissions(),
+				})
+				require.NoError(t, err)
+				defer resp.Body.Close()
+				require.Equal(t, http.StatusOK, resp.StatusCode)
+
+				var body map[string]interface{}
+				require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+				token, _ = body["token"].(string)
+				require.NotEmpty(t, token)
+				invitation, ok := body["invitation"].(map[string]interface{})
+				require.True(t, ok, "inviteMember must return the invitation")
+				invitationID, _ = invitation["id"].(string)
+				return token, invitationID
+			}
+
+			firstToken, firstID := invite()
+			// Both links name the same invitation and carry no nonce, and their time claims
+			// have one-second precision: two invites inside one second sign byte-identical
+			// tokens. Cross a second boundary so the first link really is an older one.
+			time.Sleep(time.Until(time.Now().Truncate(time.Second).Add(time.Second)))
+			resentToken, resentID := invite()
+			require.NotEqual(t, firstToken, resentToken, "the resend must sign a new link")
+
+			var rowID string
+			var rows int
+			require.NoError(t, db.QueryRow(
+				"SELECT COUNT(*), MIN(id::text) FROM workspace_invitations WHERE workspace_id = $1 AND email = $2",
+				workspaceID, inviteeEmail).Scan(&rows, &rowID))
+			require.Equal(t, 1, rows, "a resend refreshes the pending invitation, it does not add one")
+			assert.Equal(t, rowID, firstID)
+			assert.Equal(t, rowID, resentID, "the resend must report the invitation row that actually exists")
+
+			verify := func(token string) int {
+				resp, err := client.Post("/api/workspaces.verifyInvitationToken", map[string]string{"token": token})
+				require.NoError(t, err)
+				defer resp.Body.Close()
+				return resp.StatusCode
+			}
+
+			client.SetToken("")
+			assert.Equal(t, http.StatusOK, verify(resentToken), "the link in the resent email must resolve")
+			assert.Equal(t, http.StatusOK, verify(firstToken), "the link in the first email must keep working after a resend")
+
+			acceptResp, err := client.Post("/api/workspaces.acceptInvitation", map[string]string{"token": resentToken})
+			require.NoError(t, err)
+			defer acceptResp.Body.Close()
+			require.Equal(t, http.StatusOK, acceptResp.StatusCode)
+
+			var accepted map[string]interface{}
+			require.NoError(t, json.NewDecoder(acceptResp.Body).Decode(&accepted))
+			user, ok := accepted["user"].(map[string]interface{})
+			require.True(t, ok)
+
+			var memberships int
+			require.NoError(t, db.QueryRow(
+				"SELECT COUNT(*) FROM user_workspaces WHERE user_id = $1 AND workspace_id = $2",
+				user["id"], workspaceID).Scan(&memberships))
+			assert.Equal(t, 1, memberships, "accepting the resent link must seat the invitee")
+
+			require.NoError(t, db.QueryRow(
+				"SELECT COUNT(*) FROM workspace_invitations WHERE workspace_id = $1 AND email = $2",
+				workspaceID, inviteeEmail).Scan(&rows))
+			assert.Equal(t, 0, rows, "the accepted invitation must be consumed")
+		})
+
 		t.Run("accept invitation with invalid token", func(t *testing.T) {
 			client.SetToken("") // No auth required for accept
 
@@ -730,7 +930,8 @@ func TestWorkspaceMembershipSuite(t *testing.T) {
 			require.NoError(t, err)
 			defer resp.Body.Close()
 
-			assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+			// 404, not 401: the console signs out on any 401.
+			assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 
 			// Restore owner token
 			client.SetToken(ownerToken)
@@ -745,7 +946,8 @@ func TestWorkspaceMembershipSuite(t *testing.T) {
 			require.NoError(t, err)
 			defer resp.Body.Close()
 
-			assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+			// 404, not 401: the console signs out on any 401.
+			assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 
 			// Restore owner token
 			client.SetToken(ownerToken)
@@ -829,6 +1031,144 @@ func TestWorkspaceMembershipSuite(t *testing.T) {
 
 			assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
 		})
+	})
+}
+
+// ============================================================================
+// Seat limit (MAX_USERS)
+// MAX_USERS counts members plus live invitations. A resend refreshes the seat its
+// invitation already holds, and seating an existing account gives its invitation's
+// seat back: neither may cost a second seat or lock out the remaining invitees.
+// ============================================================================
+
+func TestWorkspaceSeatLimitSuite(t *testing.T) {
+	testutil.SkipIfShort(t)
+	testutil.SetupTestEnvironment()
+	defer testutil.CleanupTestEnvironment()
+
+	suite := testutil.NewIntegrationTestSuite(t, func(cfg *config.Config) testutil.AppInterface {
+		cfg.MaxUsers = 3
+		return app.NewApp(cfg)
+	})
+	defer suite.Cleanup()
+
+	client := suite.APIClient
+	db := suite.DBManager.GetDB()
+	ownerToken := testutil.NewTokenCache(client).GetOrCreate(t, "test@example.com")
+	client.SetToken(ownerToken)
+
+	invite := func(t *testing.T, workspaceID, email string) (int, map[string]interface{}) {
+		t.Helper()
+		resp, err := client.Post("/api/workspaces.inviteMember", map[string]interface{}{
+			"workspace_id": workspaceID,
+			"email":        email,
+			"permissions":  domain.NewFullPermissions(),
+		})
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		var body map[string]interface{}
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+		return resp.StatusCode, body
+	}
+	accept := func(t *testing.T, token string) int {
+		t.Helper()
+		client.SetToken("")
+		defer client.SetToken(ownerToken)
+		resp, err := client.Post("/api/workspaces.acceptInvitation", map[string]string{"token": token})
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	t.Run("resends, case variants and existing accounts at the limit", func(t *testing.T) {
+		workspaceID := createTestWorkspaceWithToken(t, client, ownerToken, "Seat Limit WS")
+		bob, carol := "seat-bob@example.com", "seat-carol@example.com"
+		// Invitations keep the owner's typing, so these count every spelling of an address.
+		invitationRows := func(t *testing.T, email string) int {
+			t.Helper()
+			var n int
+			require.NoError(t, db.QueryRow(
+				"SELECT COUNT(*) FROM workspace_invitations WHERE workspace_id = $1 AND lower(email) = lower($2)",
+				workspaceID, email).Scan(&n))
+			return n
+		}
+		accounts := func(t *testing.T, email string) int {
+			t.Helper()
+			var n int
+			require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM users WHERE lower(email) = lower($1)", email).Scan(&n))
+			return n
+		}
+
+		// owner + bob + carol = 3 seats, the limit.
+		status, _ := invite(t, workspaceID, bob)
+		require.Equal(t, http.StatusOK, status)
+		status, carolInvite := invite(t, workspaceID, carol)
+		require.Equal(t, http.StatusOK, status)
+		carolToken, _ := carolInvite["token"].(string)
+		require.NotEmpty(t, carolToken)
+
+		status, _ = invite(t, workspaceID, "seat-dave@example.com")
+		assert.Equal(t, http.StatusForbidden, status, "a new invitation at the limit takes a seat nobody has")
+
+		status, _ = invite(t, workspaceID, bob)
+		assert.Equal(t, http.StatusOK, status, "a resend reuses the seat bob's invitation holds")
+		assert.Equal(t, 1, invitationRows(t, bob))
+
+		// Typed differently, it is still bob's invitation: refreshed, not a second seat.
+		status, _ = invite(t, workspaceID, "Seat-Bob@Example.com")
+		assert.Equal(t, http.StatusOK, status)
+		assert.Equal(t, 1, invitationRows(t, bob), "a case variant must not hold a second seat")
+
+		// bob gets an account without joining this workspace, by accepting another one's
+		// invitation — as an invitee who signs in with SSO first does. Inviting him again
+		// sends his invitation again: it does not seat him without his say.
+		otherID := createTestWorkspaceWithToken(t, client, ownerToken, "Seat Limit Other WS")
+		status, otherInvite := invite(t, otherID, bob)
+		require.Equal(t, http.StatusOK, status)
+		otherToken, _ := otherInvite["token"].(string)
+		require.Equal(t, http.StatusOK, accept(t, otherToken))
+
+		status, resent := invite(t, workspaceID, bob)
+		require.Equal(t, http.StatusOK, status)
+		assert.Equal(t, "Invitation sent", resent["message"])
+		var memberships int
+		require.NoError(t, db.QueryRow(
+			`SELECT COUNT(*) FROM user_workspaces uw JOIN users u ON u.id = uw.user_id
+			 WHERE uw.workspace_id = $1 AND lower(u.email) = lower($2)`, workspaceID, bob).Scan(&memberships))
+		assert.Equal(t, 0, memberships, "a resend must not seat the invitee")
+		assert.Equal(t, 1, invitationRows(t, bob))
+
+		// owner + bob (invited) + carol (invited) = 3: accepting converts carol's own seat.
+		assert.Equal(t, http.StatusOK, accept(t, carolToken), "a full workspace must still let its invitees in")
+
+		// bob's link now finds his existing account, whatever the invitation's spelling:
+		// one account, seated, and every spelling of his invitation gone.
+		bobToken, _ := resent["token"].(string)
+		require.Equal(t, http.StatusOK, accept(t, bobToken))
+		assert.Equal(t, 1, accounts(t, bob), "accepting must not create a second account")
+		assert.Equal(t, 0, invitationRows(t, bob))
+	})
+
+	t.Run("an expired invitation holds no seat until it is sent again", func(t *testing.T) {
+		workspaceID := createTestWorkspaceWithToken(t, client, ownerToken, "Seat Expiry WS")
+		xavier, yann, zoe := "seat-xavier@example.com", "seat-yann@example.com", "seat-zoe@example.com"
+
+		for _, email := range []string{xavier, yann} {
+			status, _ := invite(t, workspaceID, email)
+			require.Equal(t, http.StatusOK, status)
+		}
+		// expires_at holds UTC wall-clock time without a time zone.
+		_, err := db.Exec(
+			`UPDATE workspace_invitations SET expires_at = (NOW() AT TIME ZONE 'UTC') - interval '1 hour'
+			 WHERE workspace_id = $1 AND email = $2`, workspaceID, yann)
+		require.NoError(t, err)
+
+		status, _ := invite(t, workspaceID, zoe)
+		require.Equal(t, http.StatusOK, status, "yann's expired invitation must not hold a seat")
+
+		// owner + xavier + zoe = 3. Sending yann's invitation again revives it: a new seat.
+		status, _ = invite(t, workspaceID, yann)
+		assert.Equal(t, http.StatusForbidden, status)
 	})
 }
 
@@ -1756,4 +2096,44 @@ func createTestWorkspaceWithWebsite(t *testing.T, client *testutil.APIClient, na
 	client.SetToken(currentToken)
 
 	return workspaceID
+}
+
+// dropLeftoverDatabase drops, after the test, every database a regression would leave for
+// name: the ones databasesAnyCase finds, so what a subtest detects is what it removes.
+// Errors are logged, so a cleanup problem never fails a subtest that passed.
+func dropLeftoverDatabase(t *testing.T, suite *testutil.IntegrationTestSuite, name string) {
+	t.Helper()
+	t.Cleanup(func() {
+		db := suite.DBManager.GetDB()
+		leftovers, err := databasesAnyCase(db, name)
+		if err != nil {
+			t.Logf("listing databases named %s: %v", name, err)
+			return
+		}
+		for _, datname := range leftovers {
+			if _, err := db.Exec("DROP DATABASE IF EXISTS " + pq.QuoteIdentifier(datname) + " WITH (FORCE)"); err != nil {
+				t.Logf("dropping database %s: %v", datname, err)
+			}
+		}
+	})
+}
+
+// databasesAnyCase lists the databases whose name is name, whatever the case of its ASCII
+// letters. Both sides use the "C" collation, the one pg_database names have, which folds
+// ASCII only, as PostgreSQL does for unquoted names.
+func databasesAnyCase(db *sql.DB, name string) ([]string, error) {
+	rows, err := db.Query(`SELECT datname FROM pg_database WHERE lower(datname) = lower($1 COLLATE "C")`, name)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var names []string
+	for rows.Next() {
+		var datname string
+		if err := rows.Scan(&datname); err != nil {
+			return nil, err
+		}
+		names = append(names, datname)
+	}
+	return names, rows.Err()
 }

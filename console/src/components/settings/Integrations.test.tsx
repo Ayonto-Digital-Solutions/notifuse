@@ -10,6 +10,7 @@ import { LicenseContext, UNKNOWN_LICENSE } from '../../contexts/licenseState'
 import type { Entitlements } from '../../types/license'
 import type { Integration, Workspace } from '../../services/api/types'
 import { workspaceService } from '../../services/api/workspace'
+import { getWebhookStatus, registerWebhook } from '../../services/api/webhook_registration'
 
 i18n.loadAndActivate({ locale: 'en', messages: {} })
 
@@ -145,6 +146,22 @@ const isolationSwitch = () =>
   within(screen.getByText('SES tenant isolation').closest('.ant-form-item') as HTMLElement).getByRole(
     'switch'
   )
+
+describe('Integrations — marketing rate limit', () => {
+  // The queue now sends at this rate, so the field has to say what it governs and what it
+  // must stay under: a limit above the provider's leads to throttling, which pauses broadcasts.
+  it('says what the rate applies to and what it must stay under', async () => {
+    await openSESDrawer()
+
+    const field = screen.getByLabelText('Rate limit for marketing emails (emails per minute)')
+    const item = field.closest('.ant-form-item') as HTMLElement
+    expect(
+      within(item).getByText(
+        "Broadcasts and automation emails are sent at up to this rate. Keep it at or below your provider's sending limit, minus your transactional traffic."
+      )
+    ).toBeInTheDocument()
+  })
+})
 
 describe('Integrations — SES tenant isolation', () => {
   // The gate is EnsureTenantIsolation's, and it still answers 402. What this pins is the order
@@ -327,5 +344,42 @@ describe('Integrations — Zapier', () => {
 
     const warning = await screen.findByText(/revokes the API key/)
     expect(warning).toHaveTextContent(/stops working/)
+  })
+})
+
+const mailjetIntegration = {
+  id: 'int_mailjet_1',
+  name: 'Transactional',
+  type: 'email',
+  email_provider: {
+    kind: 'mailjet',
+    senders: [{ id: 'sender_1', email: 'hello@acme.com', name: 'Acme', is_default: true }],
+    rate_limit_per_minute: 25,
+    mailjet: { sandbox_mode: false }
+  },
+  created_at: '2026-08-01T10:00:00Z',
+  updated_at: '2026-08-01T10:00:00Z'
+} as unknown as Integration
+
+describe('Integrations — webhook registration', () => {
+  // The console names no event, so the provider registers its default ones; for Mailjet those
+  // include the unsub webhook, registered with 'complaint'. Nothing here can ask for
+  // 'unsubscribe', which no provider registers.
+  it('registers the provider default events, naming none', async () => {
+    vi.mocked(registerWebhook).mockResolvedValue({
+      status: { email_provider_kind: 'mailjet', is_registered: true, endpoints: [] }
+    })
+    const user = userEvent.setup()
+    renderIntegrations({ integrations: [mailjetIntegration] })
+    await waitFor(() => expect(getWebhookStatus).toHaveBeenCalledTimes(1))
+
+    await user.click(await screen.findByRole('button', { name: 'Register Webhooks' }))
+
+    await waitFor(() => expect(registerWebhook).toHaveBeenCalledTimes(1))
+    expect(vi.mocked(registerWebhook).mock.calls[0][0]).toEqual({
+      workspace_id: 'ws1',
+      integration_id: 'int_mailjet_1',
+      base_url: expect.any(String)
+    })
   })
 })

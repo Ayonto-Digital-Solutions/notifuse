@@ -6,17 +6,29 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Notifuse/notifuse/internal/domain"
 	"github.com/Notifuse/notifuse/pkg/logger"
 	"github.com/Notifuse/notifuse/pkg/safehttpclient"
 	"github.com/Notifuse/notifuse/pkg/tracing"
 	"github.com/google/uuid"
+	"golang.org/x/net/idna"
 )
+
+//go:generate mockgen -destination=./mocks/mock_list_unsubscriber.go -package=mocks github.com/Notifuse/notifuse/internal/service ListUnsubscriber
+
+// ListUnsubscriber records an opt-out an email provider reported for an email on the list
+// found for it, by the rules of the email's own unsubscribe link. ListService implements
+// it.
+type ListUnsubscriber interface {
+	UnsubscribeFromMessageList(ctx context.Context, workspaceID, email, listID, messageID string) error
+}
 
 // InboundWebhookEventService implements the domain.InboundWebhookEventServiceInterface
 type InboundWebhookEventService struct {
@@ -27,6 +39,7 @@ type InboundWebhookEventService struct {
 	messageHistoryRepo domain.MessageHistoryRepository
 	contactRepo        domain.ContactRepository
 	automationRepo     domain.AutomationRepository
+	listUnsubscriber   ListUnsubscriber
 	replyParsers       map[domain.EmailProviderKind]domain.ReplyParser
 	// httpClient fetches the SNS SubscribeURL. It is SSRF-safe because that URL
 	// arrives in the request body of a public endpoint — see confirmSNSSubscription.
@@ -42,6 +55,7 @@ func NewInboundWebhookEventService(
 	messageHistoryRepo domain.MessageHistoryRepository,
 	contactRepo domain.ContactRepository,
 	automationRepo domain.AutomationRepository,
+	unsubscriber ListUnsubscriber,
 ) *InboundWebhookEventService {
 	return &InboundWebhookEventService{
 		repo:               repo,
@@ -51,6 +65,7 @@ func NewInboundWebhookEventService(
 		messageHistoryRepo: messageHistoryRepo,
 		contactRepo:        contactRepo,
 		automationRepo:     automationRepo,
+		listUnsubscriber:   unsubscriber,
 		httpClient:         safehttpclient.New(),
 		replyParsers: map[domain.EmailProviderKind]domain.ReplyParser{
 			domain.EmailProviderKindMailgun: &MailgunReplyParser{},
@@ -317,8 +332,20 @@ func (s *InboundWebhookEventService) ProcessWebhook(ctx context.Context, workspa
 		return fmt.Errorf("failed to process webhook: %w", err)
 	}
 
+	// Only the events of emails sent to their address go further, so everything below,
+	// storing included, acts on those alone
+	events, err = s.eventsOfSentEmails(ctx, workspaceID, integrationID, events)
+	if err != nil {
+		// codecov:ignore:start
+		tracing.MarkSpanError(ctx, err)
+		// codecov:ignore:end
+		return err
+	}
+	if len(events) == 0 {
+		return nil
+	}
+
 	// Store the event
-	// No authentication needed for webhook events as they come from external providers
 	if err := s.repo.StoreEvents(ctx, workspaceID, events); err != nil {
 		// codecov:ignore:start
 		tracing.MarkSpanError(ctx, err)
@@ -329,6 +356,7 @@ func (s *InboundWebhookEventService) ProcessWebhook(ctx context.Context, workspa
 	updates := []domain.MessageEventUpdate{}
 	var hardEmails []string
 	var softCountEmails []string
+	var unsubscribes []*domain.InboundWebhookEvent
 
 	for _, event := range events {
 		switch event.Type {
@@ -391,6 +419,9 @@ func (s *InboundWebhookEventService) ProcessWebhook(ctx context.Context, workspa
 					StatusInfo: &reason,
 				})
 			}
+
+		case domain.EmailEventUnsubscribe:
+			unsubscribes = append(unsubscribes, event)
 		}
 	}
 
@@ -426,7 +457,215 @@ func (s *InboundWebhookEventService) ProcessWebhook(ctx context.Context, workspa
 		}
 	}
 
+	// Last, so an unsubscribe in the same delivery as a complaint or a hard bounce finds
+	// it recorded, and keeps it
+	if err := s.recordUnsubscribes(ctx, workspaceID, unsubscribes); err != nil {
+		// codecov:ignore:start
+		tracing.MarkSpanError(ctx, err)
+		// codecov:ignore:end
+		return fmt.Errorf("failed to record unsubscribes: %w", err)
+	}
+
 	return nil
+}
+
+// eventsOfSentEmails keeps the events that name an email of the workspace sent to the
+// address they report, as sameAddress compares them, and gives each the address stored on
+// its email, which is the contact's. The others are left out: an event about an email
+// Notifuse did not send, which carries only the provider's own id, or about someone the
+// email was copied to, changes nothing and is not stored. The emails are looked up in one
+// query.
+func (s *InboundWebhookEventService) eventsOfSentEmails(ctx context.Context, workspaceID, integrationID string, events []*domain.InboundWebhookEvent) ([]*domain.InboundWebhookEvent, error) {
+	named := func(event *domain.InboundWebhookEvent) bool {
+		return event.MessageID != nil && *event.MessageID != "" && event.RecipientEmail != ""
+	}
+
+	var ids []string
+	for _, event := range events {
+		if named(event) {
+			ids = append(ids, *event.MessageID)
+		}
+	}
+	var recipients map[string]string
+	if len(ids) > 0 {
+		var err error
+		recipients, err = s.messageHistoryRepo.GetRecipients(ctx, workspaceID, dedupeStrings(ids))
+		if err != nil {
+			return nil, fmt.Errorf("failed to look up the emails the events name: %w", err)
+		}
+	}
+
+	kept := make([]*domain.InboundWebhookEvent, 0, len(events))
+	ignored := 0
+	firstIgnoredID := ""
+	for _, event := range events {
+		if named(event) {
+			if recipient, ok := recipients[*event.MessageID]; ok && sameAddress(recipient, event.RecipientEmail) {
+				event.RecipientEmail = recipient
+				kept = append(kept, event)
+				continue
+			}
+		}
+		if firstIgnoredID == "" && event.MessageID != nil {
+			firstIgnoredID = *event.MessageID
+		}
+		ignored++
+	}
+	// The id comes from the request, so a long one is cut to keep the line short
+	if len(firstIgnoredID) > maxLoggedMessageIDLength {
+		firstIgnoredID = domain.TruncateUTF8(firstIgnoredID, maxLoggedMessageIDLength) + "…(truncated)"
+	}
+
+	if ignored > 0 {
+		s.logger.WithField("workspace_id", workspaceID).
+			WithField("integration_id", integrationID).
+			WithField("ignored", ignored).
+			WithField("first_message_id", firstIgnoredID).
+			Info("Ignored provider events that name no email sent to their address")
+	}
+	return kept, nil
+}
+
+// maxLoggedMessageIDLength is the most bytes of a message ID the ignored-events line carries.
+const maxLoggedMessageIDLength = 255
+
+// sameAddress reports whether reported, the address a provider gives in an event, is stored,
+// the address the email was sent to. The letter case and surrounding spaces aside, an
+// international domain can come back in Unicode or in Punycode, and a provider reports the
+// address in the form it was sent: SES's (encodeEmailAddress), a non-ASCII local part
+// encoded, and SparkPost's in sandbox mode, its sink domain appended.
+func sameAddress(stored, reported string) bool {
+	stored, reported = strings.TrimSpace(stored), strings.TrimSpace(reported)
+	if strings.EqualFold(stored, reported) {
+		return true
+	}
+	if sink := len(reported) - len(sparkPostSinkSuffix); sink > 0 && strings.EqualFold(reported[sink:], sparkPostSinkSuffix) {
+		reported = reported[:sink]
+	}
+	storedForm, storedOK := addressForm(stored, maxDomainLength)
+	// SES is sent the domain converted to Punycode as stored, not composed or lowercased first
+	// as a DNS lookup does
+	sentForm, sentOK := "", false
+	if sent, err := encodeEmailAddress(stored); err == nil {
+		sentForm, sentOK = addressForm(sent, maxDomainLength)
+	}
+	if !storedOK && !sentOK {
+		return false
+	}
+	// A reported domain longer than both forms of the stored one, by more than characters DNS
+	// ignores, names another domain, so it is not looked up
+	limit := max(domainLength(storedForm), domainLength(sentForm)) + maxIgnoredDomainCharacters
+	reportedForm, ok := addressForm(reported, limit)
+	if !ok {
+		return false
+	}
+	return (storedOK && storedForm == reportedForm) || (sentOK && sentForm == reportedForm)
+}
+
+// domainLength is the length in bytes of the domain of an address form, 0 for none.
+func domainLength(form string) int {
+	if form == "" {
+		return 0
+	}
+	return len(form) - strings.LastIndex(form, "@") - 1
+}
+
+// maxIgnoredDomainCharacters is how many more characters than the stored domain's forms a
+// reported domain may hold and still be looked up: room for characters DNS drops, such as a
+// soft hyphen.
+const maxIgnoredDomainCharacters = 8
+
+// maxDomainLength is the most characters a domain DNS holds has in its ASCII form. A domain
+// reported in Unicode has no more, unless written with characters DNS drops or composes.
+const maxDomainLength = 253
+
+// maxAddressLength, in bytes, is beyond any spelling of an address SMTP carries: its local
+// part of at most 64 bytes encoded, its domain in Unicode.
+const maxAddressLength = 2048
+
+// addressForm spells an address one way whatever the spelling it comes in: the local part
+// decoded when encoded, and lowercased, the domain as DNS looks it up (Punycode, the letter
+// case and the Unicode composition aside), or lowercased when DNS refuses it. Decoding and
+// encoding take time growing with the square of the length, so a domain longer than DNS
+// holds, or than maxDomain characters, is lowercased unread, and a longer address than any
+// spelling of one has no form. ok is false for what is no address.
+func addressForm(address string, maxDomain int) (string, bool) {
+	at := strings.LastIndex(address, "@")
+	if at <= 0 || at == len(address)-1 || len(address) > maxAddressLength {
+		return "", false
+	}
+	local := address[:at]
+	if decoded, err := new(mime.WordDecoder).DecodeHeader(local); err == nil {
+		local = decoded
+	}
+	domain := address[at+1:]
+	if utf8.RuneCountInString(domain) <= min(maxDomain, maxDomainLength) {
+		if ascii, err := idna.Lookup.ToASCII(domain); err == nil {
+			domain = ascii
+		}
+	}
+	return strings.ToLower(local) + "@" + strings.ToLower(domain), true
+}
+
+// recordUnsubscribes records the opt-outs a provider reported. The email is marked
+// unsubscribed, which counts it in statistics and fires its email.unsubscribed events once.
+// When a list is found for the email, the list service first records the opt-out there, by
+// the rules of the email's own unsubscribe link. Unlike that link, which leaves the email
+// unmarked when its list was deleted since, this marks it then too, on purpose: its
+// recipient did unsubscribe from it. Nothing is recorded for an email Notifuse did not
+// send, or for an opt-out of another address than the email's recipient, such as someone
+// the email was copied to. eventsOfSentEmails already left those out; the email is read
+// again here for its list, and checked again, as its contact may have been erased since.
+// An erased contact's emails are kept with the address redacted, so they fall in that
+// last case. When the erasure lands while this runs, the opt-out may
+// still be recorded on the list before it, but the email is not marked: the repository
+// does not mark a redacted email unsubscribed.
+//
+// It stops at the first failure, and still marks the emails handled before it, those sent
+// for no list included: the opt-outs recorded on their lists are committed, so they are
+// marked now rather than on the provider's retry of the delivery.
+func (s *InboundWebhookEventService) recordUnsubscribes(ctx context.Context, workspaceID string, events []*domain.InboundWebhookEvent) error {
+	var updates []domain.MessageEventUpdate
+	var failed error
+	for _, event := range events {
+		if event.MessageID == nil || *event.MessageID == "" {
+			continue
+		}
+		messageID := *event.MessageID
+
+		message, err := s.messageHistoryRepo.GetRecipientAndList(ctx, workspaceID, messageID)
+		if err != nil {
+			failed = err
+			break
+		}
+		if message == nil {
+			s.logger.WithField("message_id", messageID).Info("Unsubscribe skipped: unknown message")
+			continue
+		}
+		if !strings.EqualFold(message.ContactEmail, event.RecipientEmail) {
+			s.logger.WithField("message_id", messageID).Warn("Unsubscribe skipped: reported for another address than the email's recipient")
+			continue
+		}
+		// An email sent for no list, such as a transactional one, is only marked
+		if message.ListID != nil && *message.ListID != "" {
+			if err := s.listUnsubscriber.UnsubscribeFromMessageList(ctx, workspaceID, message.ContactEmail, *message.ListID, messageID); err != nil {
+				failed = fmt.Errorf("failed to unsubscribe from the list of message %s: %w", messageID, err)
+				break
+			}
+		}
+		updates = append(updates, domain.MessageEventUpdate{
+			ID:        messageID,
+			Event:     domain.MessageEventUnsubscribed,
+			Timestamp: event.Timestamp,
+		})
+	}
+
+	if len(updates) > 0 {
+		if err := s.messageHistoryRepo.SetStatusesIfNotSet(ctx, workspaceID, updates); err != nil {
+			failed = errors.Join(failed, err)
+		}
+	}
+	return failed
 }
 
 // dedupeStrings returns a new slice with duplicates removed, preserving the
@@ -550,18 +789,33 @@ func (s *InboundWebhookEventService) processSESWebhook(integrationID string, raw
 
 	// Determine the type of notification
 	var eventType domain.EmailEventType
-	var recipientEmail, messageID string
-	var bounceType, bounceCategory, bounceDiagnostic, complaintFeedbackType string
+	var messageID string
+	var bounceType, bounceCategory, complaintFeedbackType string
 	var timestamp time.Time
 	var notifuseMessageID string
+	// A notification lists every recipient of the email it reports on, an address the email
+	// was copied to among them. Each gets its own event, so the email's own recipient is found
+	// whatever its place in the list. One listed twice gets one, so a bounce is not counted
+	// twice, and no more are read than an SES email can have.
+	type sesRecipient struct{ email, diagnostic string }
+	var recipients []sesRecipient
+	seen := map[string]bool{}
+	addRecipient := func(email, diagnostic string) {
+		if email == "" {
+			return
+		}
+		if key := domain.NormalizeEmail(email); !seen[key] && len(recipients) < sesMaxRecipients {
+			seen[key] = true
+			recipients = append(recipients, sesRecipient{email: email, diagnostic: diagnostic})
+		}
+	}
 
 	// Try to unmarshal as bounce notification
 	var bounceNotification domain.SESBounceNotification
 	if err := json.Unmarshal(messageBytes, &bounceNotification); err == nil && bounceNotification.EventType == "Bounce" {
 		eventType = domain.EmailEventBounce
-		if len(bounceNotification.Bounce.BouncedRecipients) > 0 {
-			recipientEmail = bounceNotification.Bounce.BouncedRecipients[0].EmailAddress
-			bounceDiagnostic = bounceNotification.Bounce.BouncedRecipients[0].DiagnosticCode
+		for _, recipient := range bounceNotification.Bounce.BouncedRecipients {
+			addRecipient(recipient.EmailAddress, recipient.DiagnosticCode)
 		}
 		messageID = bounceNotification.Mail.MessageID
 		bounceType = bounceNotification.Bounce.BounceType
@@ -589,8 +843,8 @@ func (s *InboundWebhookEventService) processSESWebhook(integrationID string, raw
 		var complaintNotification domain.SESComplaintNotification
 		if err := json.Unmarshal(messageBytes, &complaintNotification); err == nil && complaintNotification.EventType == "Complaint" {
 			eventType = domain.EmailEventComplaint
-			if len(complaintNotification.Complaint.ComplainedRecipients) > 0 {
-				recipientEmail = complaintNotification.Complaint.ComplainedRecipients[0].EmailAddress
+			for _, recipient := range complaintNotification.Complaint.ComplainedRecipients {
+				addRecipient(recipient.EmailAddress, "")
 			}
 			messageID = complaintNotification.Mail.MessageID
 			complaintFeedbackType = complaintNotification.Complaint.ComplaintFeedbackType
@@ -617,8 +871,8 @@ func (s *InboundWebhookEventService) processSESWebhook(integrationID string, raw
 			var deliveryNotification domain.SESDeliveryNotification
 			if err := json.Unmarshal(messageBytes, &deliveryNotification); err == nil && deliveryNotification.EventType == "Delivery" {
 				eventType = domain.EmailEventDelivered
-				if len(deliveryNotification.Delivery.Recipients) > 0 {
-					recipientEmail = deliveryNotification.Delivery.Recipients[0]
+				for _, recipient := range deliveryNotification.Delivery.Recipients {
+					addRecipient(recipient, "")
 				}
 				messageID = deliveryNotification.Mail.MessageID
 
@@ -654,30 +908,39 @@ func (s *InboundWebhookEventService) processSESWebhook(integrationID string, raw
 		messageID = notifuseMessageID
 	}
 
-	// Create the webhook event
-	event := domain.NewInboundWebhookEvent(
-		uuid.New().String(),
-		eventType,
-		domain.WebhookSourceSES,
-		integrationID,
-		recipientEmail,
-		&messageID,
-		timestamp,
-		string(rawPayload),
-	)
+	// The events share one copy of the payload
+	payload := string(rawPayload)
+	events = make([]*domain.InboundWebhookEvent, 0, len(recipients))
+	for _, recipient := range recipients {
+		eventMessageID := messageID
+		event := domain.NewInboundWebhookEvent(
+			uuid.New().String(),
+			eventType,
+			domain.WebhookSourceSES,
+			integrationID,
+			recipient.email,
+			&eventMessageID,
+			timestamp,
+			payload,
+		)
 
-	// Set event-specific information
-	switch eventType {
-	case domain.EmailEventBounce:
-		event.BounceType = bounceType
-		event.BounceCategory = bounceCategory
-		event.BounceDiagnostic = bounceDiagnostic
-	case domain.EmailEventComplaint:
-		event.ComplaintFeedbackType = complaintFeedbackType
+		// Set event-specific information
+		switch eventType {
+		case domain.EmailEventBounce:
+			event.BounceType = bounceType
+			event.BounceCategory = bounceCategory
+			event.BounceDiagnostic = recipient.diagnostic
+		case domain.EmailEventComplaint:
+			event.ComplaintFeedbackType = complaintFeedbackType
+		}
+		events = append(events, event)
 	}
 
-	return []*domain.InboundWebhookEvent{event}, nil
+	return events, nil
 }
+
+// sesMaxRecipients is the most recipients an SES email can have, To, CC and BCC together
+const sesMaxRecipients = 50
 
 // processPostmarkWebhook processes a webhook event from Postmark
 func (s *InboundWebhookEventService) processPostmarkWebhook(integrationID string, rawPayload []byte) (events []*domain.InboundWebhookEvent, err error) {
@@ -908,14 +1171,18 @@ func (s *InboundWebhookEventService) processMailgunWebhook(integrationID string,
 func (s *InboundWebhookEventService) processSparkPostWebhook(integrationID string, rawPayload []byte) (events []*domain.InboundWebhookEvent, err error) {
 	events = []*domain.InboundWebhookEvent{}
 
-	// payload can contain multiple events
-	var payload []*domain.SparkPostWebhookPayload
-
-	if err := json.Unmarshal(rawPayload, &payload); err != nil {
+	// payload can contain multiple events; each keeps its own element as raw payload
+	var rawEvents []json.RawMessage
+	if err := json.Unmarshal(rawPayload, &rawEvents); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal SparkPost webhook payload: %w", err)
 	}
 
-	for _, payload := range payload {
+	for _, rawEvent := range rawEvents {
+		var payload domain.SparkPostWebhookPayload
+		if err := json.Unmarshal(rawEvent, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal SparkPost webhook payload: %w", err)
+		}
+
 		var eventType domain.EmailEventType
 		var recipientEmail, messageID string
 		var bounceType, bounceCategory, bounceDiagnostic, complaintFeedbackType string
@@ -989,7 +1256,7 @@ func (s *InboundWebhookEventService) processSparkPostWebhook(integrationID strin
 			recipientEmail,
 			&messageID,
 			timestamp,
-			string(rawPayload),
+			string(rawEvent),
 		)
 
 		// Set event-specific information
@@ -1011,13 +1278,17 @@ func (s *InboundWebhookEventService) processSparkPostWebhook(integrationID strin
 // processMailjetWebhook processes a webhook event from Mailjet
 func (s *InboundWebhookEventService) processMailjetWebhook(integrationID string, rawPayload []byte) (events []*domain.InboundWebhookEvent, err error) {
 	// Mailjet can send either a single object or an array of events
-	// First try to unmarshal as an array
-	var payloadArray []domain.MailjetWebhookPayload
-	if err := json.Unmarshal(rawPayload, &payloadArray); err == nil {
+	// First try to unmarshal as an array; each event keeps its own element as raw payload
+	var rawEvents []json.RawMessage
+	if err := json.Unmarshal(rawPayload, &rawEvents); err == nil {
 		// Successfully unmarshaled as array, process each event
 		var allEvents []*domain.InboundWebhookEvent
-		for _, payload := range payloadArray {
-			event, err := s.processSingleMailjetEvent(integrationID, payload, rawPayload)
+		for _, rawEvent := range rawEvents {
+			var payload domain.MailjetWebhookPayload
+			if err := json.Unmarshal(rawEvent, &payload); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal Mailjet webhook event: %w", err)
+			}
+			event, err := s.processSingleMailjetEvent(integrationID, payload, rawEvent)
 			if err != nil {
 				return nil, err
 			}
@@ -1103,9 +1374,10 @@ func (s *InboundWebhookEventService) processSingleMailjetEvent(integrationID str
 			complaintFeedbackType = payload.Source
 		}
 	case "unsub":
-		// Unsubscribe events can be treated as complaints for tracking purposes
-		eventType = domain.EmailEventComplaint
-		complaintFeedbackType = "unsubscribe"
+		// The recipient unsubscribed through Mailjet, whose API overwrites the email's own
+		// unsubscribe links: an opt-out, not a spam complaint. mj_list_id names a Mailjet
+		// contact list, not a Notifuse one, so the list found for the email is used.
+		eventType = domain.EmailEventUnsubscribe
 	default:
 		return nil, fmt.Errorf("unsupported Mailjet event type: %s", payload.Event)
 	}
@@ -1198,15 +1470,20 @@ func (s *InboundWebhookEventService) processSMTPWebhook(integrationID string, ra
 // processSendGridWebhook processes webhook events from SendGrid
 // SendGrid sends events as a JSON array with custom_args flattened into top-level fields
 func (s *InboundWebhookEventService) processSendGridWebhook(integrationID string, rawPayload []byte) (events []*domain.InboundWebhookEvent, err error) {
-	// SendGrid sends webhooks as a JSON array of events
-	var payload []domain.SendGridWebhookEvent
-	if err := json.Unmarshal(rawPayload, &payload); err != nil {
+	// SendGrid sends webhooks as a JSON array of events; each keeps its own element as raw payload
+	var rawEvents []json.RawMessage
+	if err := json.Unmarshal(rawPayload, &rawEvents); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal SendGrid webhook payload: %w", err)
 	}
 
 	events = []*domain.InboundWebhookEvent{}
 
-	for _, sgEvent := range payload {
+	for _, rawEvent := range rawEvents {
+		var sgEvent domain.SendGridWebhookEvent
+		if err := json.Unmarshal(rawEvent, &sgEvent); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal SendGrid webhook payload: %w", err)
+		}
+
 		var eventType domain.EmailEventType
 		var bounceType, bounceCategory, bounceDiagnostic, complaintFeedbackType string
 
@@ -1271,7 +1548,7 @@ func (s *InboundWebhookEventService) processSendGridWebhook(integrationID string
 			recipientEmail,
 			&messageID,
 			timestamp,
-			string(rawPayload),
+			string(rawEvent),
 		)
 
 		// Set event-specific information

@@ -3,9 +3,9 @@ package config
 import (
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -15,20 +15,26 @@ import (
 	"github.com/spf13/viper"
 )
 
-const VERSION = "41.0"
+const VERSION = "42.0"
 
 type Config struct {
-	Server              ServerConfig
-	Database            DatabaseConfig
-	Security            SecurityConfig
-	Tracing             TracingConfig
-	SMTP                SMTPConfig
-	SMTPBridge          SMTPBridgeConfig
-	OIDC                OIDCConfig
-	Demo                DemoConfig
-	Broadcast           BroadcastConfig
+	Server     ServerConfig
+	Database   DatabaseConfig
+	Security   SecurityConfig
+	Tracing    TracingConfig
+	SMTP       SMTPConfig
+	SMTPBridge SMTPBridgeConfig
+	OIDC       OIDCConfig
+	Demo       DemoConfig
+	Broadcast  BroadcastConfig
+	// Webhook holds settings for OUTGOING webhooks — the subscriptions and the
+	// automation webhook nodes this deployment posts to. Not to be confused with
+	// WebhookEndpoint below, which is the public address email providers post
+	// INBOUND events to.
+	Webhook             WebhookConfig
 	TaskScheduler       TaskSchedulerConfig
 	AutomationScheduler AutomationSchedulerConfig
+	EmailQueue          EmailQueueConfig
 	Plan                PlanLimitsConfig
 	Telemetry           bool
 	CheckForUpdates     bool
@@ -43,6 +49,10 @@ type Config struct {
 	IsInstalled         bool // NEW: Indicates if setup wizard has been completed
 	MaxUsers            int  // 0 = unlimited (backward compat for self-hosted)
 	MaxWorkspaces       int  // 0 = unlimited (backward compat for self-hosted)
+
+	// UnopenedSettings names the encrypted system settings no key of SECRET_KEY opened
+	// when the configuration loaded; Notifuse runs without them.
+	UnopenedSettings []string
 
 	// LicenseKey is the raw NOTIFUSE_LICENSE_KEY envelope, unverified. It is carried
 	// verbatim because verifying it needs the public key compiled into the binary, which
@@ -131,8 +141,21 @@ type SecurityConfig struct {
 	// JWTSecret for token signing (derived from SecretKey)
 	JWTSecret []byte
 
-	// SecretKey for DB encryption AND JWT signing
+	// SecretKey for DB encryption AND JWT signing: the first key of SECRET_KEY
 	SecretKey string
+
+	// PreviousSecretKeys are the other keys of SECRET_KEY. They only decrypt, so
+	// the stored data can be re-encrypted with SecretKey at startup; nothing that
+	// signs or verifies receives them.
+	PreviousSecretKeys []string
+
+	// SecretKeyIsList records that SECRET_KEY had a comma, so the startup check
+	// confirms the keys open the stored data before anything uses it.
+	SecretKeyIsList bool
+
+	// KeyVariable is the variable the keys came from, SECRET_KEY or
+	// PASETO_PRIVATE_KEY, for the messages that name it.
+	KeyVariable string
 }
 
 type SSLConfig struct {
@@ -207,6 +230,24 @@ type BroadcastConfig struct {
 	AllowPrivateDataFeedHosts bool
 }
 
+type WebhookConfig struct {
+	// AllowPrivateDeliveryHosts disables SSRF protection on outgoing webhooks,
+	// allowing subscriptions and automation webhook nodes to target
+	// private/loopback/link-local addresses. Off by default. Only enable in
+	// trusted, self-hosted deployments that intentionally deliver webhooks to
+	// services on their internal network.
+	//
+	// Deliberately separate from BroadcastConfig.AllowPrivateDataFeedHosts:
+	// fetching feed content and posting webhooks are different features, and an
+	// operator who needs one should not be granted the other without naming it.
+	// Subscriptions and webhook nodes are one feature — posting an event about a
+	// contact to a URL a member chose, typically to the same internal receivers —
+	// so they share this setting. Turning it on trusts holders of
+	// webhook_subscriptions:write and of automations:write alike with the
+	// deployment's network.
+	AllowPrivateDeliveryHosts bool
+}
+
 type TaskSchedulerConfig struct {
 	Enabled  bool          // Enable/disable internal scheduler
 	Interval time.Duration // Tick interval (default: 20s)
@@ -217,6 +258,14 @@ type AutomationSchedulerConfig struct {
 	Delay     time.Duration // Delay before scheduler starts (default: 30s)
 	Interval  time.Duration // Polling interval (default: 10s)
 	BatchSize int           // Contacts per batch (default: 50)
+}
+
+// EmailQueueConfig sets how many broadcast and automation emails each email
+// integration sends at once. SMTP has its own setting because every email opens its own
+// connection, and relays often limit how many they accept at once.
+type EmailQueueConfig struct {
+	Concurrency     int // EMAIL_QUEUE_CONCURRENCY (default: 10)
+	SMTPConcurrency int // EMAIL_QUEUE_SMTP_CONCURRENCY (default: 1)
 }
 
 // PlanLimitsConfig holds the quotas of the subscribed plan. Notifuse Cloud sets
@@ -266,6 +315,11 @@ type SystemSettings struct {
 	OIDCButtonLabel     string
 	OIDCAutoCreateUsers bool
 	OIDCAllowedDomains  string
+
+	// UnopenedSettings names the encrypted settings no key opened, left empty above;
+	// unopened keeps their stored values, to tell what would open them.
+	UnopenedSettings []string
+	unopened         map[string]string
 }
 
 // getSystemDSN constructs the database connection string for the system database
@@ -301,8 +355,10 @@ func getSystemDSN(cfg *DatabaseConfig) string {
 	return dsn
 }
 
-// loadSystemSettings loads configuration from the database settings table
-func loadSystemSettings(db *sql.DB, secretKey string) (*SystemSettings, error) {
+// loadSystemSettings loads configuration from the database settings table. Encrypted
+// settings open with the first of keys that opens them: before the startup
+// re-encryption, they may still be under a previous key.
+func loadSystemSettings(db *sql.DB, keys []string) (*SystemSettings, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -359,18 +415,10 @@ func loadSystemSettings(db *sql.DB, secretKey string) (*SystemSettings, error) {
 		settings.SMTPEHLOHostname = settingsMap["smtp_ehlo_hostname"]
 
 		// Decrypt SMTP username if present
-		if encryptedUsername, ok := settingsMap["encrypted_smtp_username"]; ok && encryptedUsername != "" {
-			if decrypted, err := crypto.DecryptFromHexString(encryptedUsername, secretKey); err == nil {
-				settings.SMTPUsername = decrypted
-			}
-		}
+		settings.SMTPUsername = settings.decrypt(settingsMap, "encrypted_smtp_username", keys)
 
 		// Decrypt SMTP password if present
-		if encryptedPassword, ok := settingsMap["encrypted_smtp_password"]; ok && encryptedPassword != "" {
-			if decrypted, err := crypto.DecryptFromHexString(encryptedPassword, secretKey); err == nil {
-				settings.SMTPPassword = decrypted
-			}
-		}
+		settings.SMTPPassword = settings.decrypt(settingsMap, "encrypted_smtp_password", keys)
 
 		// Load telemetry setting
 		if telemetry, ok := settingsMap["telemetry_enabled"]; ok {
@@ -393,18 +441,10 @@ func loadSystemSettings(db *sql.DB, secretKey string) (*SystemSettings, error) {
 		}
 
 		// Decrypt SMTP Bridge TLS certificate if present
-		if encryptedCert, ok := settingsMap["encrypted_smtp_bridge_tls_cert_base64"]; ok && encryptedCert != "" {
-			if decrypted, err := crypto.DecryptFromHexString(encryptedCert, secretKey); err == nil {
-				settings.SMTPBridgeTLSCertBase64 = decrypted
-			}
-		}
+		settings.SMTPBridgeTLSCertBase64 = settings.decrypt(settingsMap, "encrypted_smtp_bridge_tls_cert_base64", keys)
 
 		// Decrypt SMTP Bridge TLS key if present
-		if encryptedKey, ok := settingsMap["encrypted_smtp_bridge_tls_key_base64"]; ok && encryptedKey != "" {
-			if decrypted, err := crypto.DecryptFromHexString(encryptedKey, secretKey); err == nil {
-				settings.SMTPBridgeTLSKeyBase64 = decrypted
-			}
-		}
+		settings.SMTPBridgeTLSKeyBase64 = settings.decrypt(settingsMap, "encrypted_smtp_bridge_tls_key_base64", keys)
 
 		// OIDC settings
 		if v, ok := settingsMap["oidc_enabled"]; ok {
@@ -421,14 +461,102 @@ func loadSystemSettings(db *sql.DB, secretKey string) (*SystemSettings, error) {
 		settings.OIDCAllowedDomains = settingsMap["oidc_allowed_domains"]
 
 		// Decrypt OIDC client secret if present (mirror encrypted_smtp_password)
-		if enc, ok := settingsMap["encrypted_oidc_client_secret"]; ok && enc != "" {
-			if dec, err := crypto.DecryptFromHexString(enc, secretKey); err == nil {
-				settings.OIDCClientSecret = dec
-			}
-		}
+		settings.OIDCClientSecret = settings.decrypt(settingsMap, "encrypted_oidc_client_secret", keys)
 	}
 
 	return settings, nil
+}
+
+// decrypt returns the stored setting called name, opened with keys. A setting no key
+// opens is empty and named in UnopenedSettings.
+func (s *SystemSettings) decrypt(settingsMap map[string]string, name string, keys []string) string {
+	value := settingsMap[name]
+	if value == "" {
+		return ""
+	}
+	decrypted, _, err := crypto.DecryptWithKeys(value, keys)
+	if err != nil {
+		s.UnopenedSettings = append(s.UnopenedSettings, name)
+		if s.unopened == nil {
+			s.unopened = map[string]string{}
+		}
+		s.unopened[name] = value
+		return ""
+	}
+	return decrypted
+}
+
+func unopenedSettings(settings *SystemSettings) []string {
+	if settings == nil {
+		return nil
+	}
+	return settings.UnopenedSettings
+}
+
+// checkUnopenedSettings refuses the start when a feature that is on needs a stored
+// setting no key of security opens: the feature would otherwise fail on its own terms
+// (OIDC_CLIENT_SECRET is empty) or, for the SMTP bridge outside production, run without
+// TLS. A value the environment gives needs nothing stored.
+func checkUnopenedSettings(settings *SystemSettings, oidc OIDCConfig, bridge SMTPBridgeConfig, security SecurityConfig) error {
+	if settings == nil || len(settings.UnopenedSettings) == 0 {
+		return nil
+	}
+	variable := security.KeyVariable
+	if variable == "" {
+		variable = "SECRET_KEY"
+	}
+	refuse := func(feature, alternative string, needed ...string) error {
+		var names []string
+		for _, name := range needed {
+			if slices.Contains(settings.UnopenedSettings, name) {
+				names = append(names, name)
+			}
+		}
+		if len(names) == 0 {
+			return nil
+		}
+		needs := fmt.Sprintf("the stored settings %s, which %s needs", strings.Join(names, ", "), feature)
+		// A list with previous keys replaces the key; a list of one is a key whose commas
+		// were doubled, which may have been kept in quotes as a single key was.
+		if len(security.PreviousSecretKeys) == 0 {
+			opens := func(candidate string) bool {
+				for _, name := range names {
+					if _, _, err := crypto.DecryptWithKeys(settings.unopened[name], []string{candidate}); err == nil {
+						return true
+					}
+				}
+				return false
+			}
+			if hint := KeyHint(security.SecretKey, variable, opens); hint != "" {
+				return fmt.Errorf("%s opens none of %s, but %s", variable, needs, hint)
+			}
+		}
+		return fmt.Errorf("no key in %s opens %s. %s. Or %s", variable, needs, StoredDataRemedy(variable), alternative)
+	}
+
+	if oidc.Enabled && oidc.ClientSecret == "" {
+		if err := refuse("single sign-on (OIDC)", "give the secret in OIDC_CLIENT_SECRET",
+			"encrypted_oidc_client_secret"); err != nil {
+			return err
+		}
+	}
+	// A mode that is not valid is resolveSMTPBridgeTLSMode's to report.
+	if bridge.Enabled && bridge.TLSMode != smtp_bridge.ModeOff &&
+		(bridge.TLSMode == "" || smtp_bridge.ValidateMode(bridge.TLSMode) == nil) {
+		var needed []string
+		if bridge.TLSCertBase64 == "" {
+			needed = append(needed, "encrypted_smtp_bridge_tls_cert_base64")
+		}
+		if bridge.TLSKeyBase64 == "" {
+			needed = append(needed, "encrypted_smtp_bridge_tls_key_base64")
+		}
+		if err := refuse("the SMTP bridge", "give the certificate and key in SMTP_BRIDGE_TLS_CERT_BASE64 and "+
+			"SMTP_BRIDGE_TLS_KEY_BASE64, or set SMTP_BRIDGE_TLS=off behind a proxy that terminates TLS",
+			needed...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Load loads the configuration with default options
@@ -520,6 +648,10 @@ func LoadWithOptions(opts LoadOptions) (*Config, error) {
 	v.SetDefault("AUTOMATION_SCHEDULER_INTERVAL", "10s")
 	v.SetDefault("AUTOMATION_SCHEDULER_BATCH_SIZE", 50)
 
+	// Email queue defaults
+	v.SetDefault("EMAIL_QUEUE_CONCURRENCY", 10)
+	v.SetDefault("EMAIL_QUEUE_SMTP_CONCURRENCY", 1)
+
 	// Plan limit defaults: 0 = unlimited, so a self-hosted install that sets none
 	// of them is unaffected. Unlike SMTP_BRIDGE_ENABLED/OIDC_*, these have no
 	// database fallback, so a viper default shadows nothing.
@@ -582,15 +714,39 @@ func LoadWithOptions(opts LoadOptions) (*Config, error) {
 		return nil, fmt.Errorf("DB_MAX_CONNECTIONS_PER_DB cannot exceed 50 (got %d)", dbConfig.MaxConnectionsPerDB)
 	}
 
+	emailQueueConfig := EmailQueueConfig{
+		Concurrency:     v.GetInt("EMAIL_QUEUE_CONCURRENCY"),
+		SMTPConcurrency: v.GetInt("EMAIL_QUEUE_SMTP_CONCURRENCY"),
+	}
+	for _, setting := range []struct {
+		name  string
+		value int
+	}{
+		{"EMAIL_QUEUE_CONCURRENCY", emailQueueConfig.Concurrency},
+		{"EMAIL_QUEUE_SMTP_CONCURRENCY", emailQueueConfig.SMTPConcurrency},
+	} {
+		if setting.value < 1 {
+			return nil, fmt.Errorf("%s must be at least 1 (got %d)", setting.name, setting.value)
+		}
+		if setting.value > 50 {
+			return nil, fmt.Errorf("%s cannot exceed 50 (got %d)", setting.name, setting.value)
+		}
+	}
+
 	// SECRET_KEY resolution (CRITICAL for decryption and JWT signing)
-	secretKey := v.GetString("SECRET_KEY")
+	secretKey, secretKeyVar := v.GetString("SECRET_KEY"), "SECRET_KEY"
 	if secretKey == "" {
 		// Fallback for backward compatibility
-		secretKey = v.GetString("PASETO_PRIVATE_KEY")
+		secretKey, secretKeyVar = v.GetString("PASETO_PRIVATE_KEY"), "PASETO_PRIVATE_KEY"
 	}
 	if secretKey == "" {
 		// REQUIRED - fail fast if both are empty
 		return nil, fmt.Errorf("SECRET_KEY (or PASETO_PRIVATE_KEY for backward compatibility) must be set")
+	}
+
+	security, err := NewSecurityConfig(secretKey, secretKeyVar)
+	if err != nil {
+		return nil, err
 	}
 
 	// Try to load system settings from database
@@ -602,7 +758,7 @@ func LoadWithOptions(opts LoadOptions) (*Config, error) {
 		defer func() { _ = db.Close() }()
 		if err := db.Ping(); err == nil {
 			// Database is accessible, try to load settings
-			systemSettings, err = loadSystemSettings(db, secretKey)
+			systemSettings, err = loadSystemSettings(db, security.DecryptionKeys())
 			if err == nil && systemSettings != nil {
 				isInstalled = systemSettings.IsInstalled
 			}
@@ -689,24 +845,6 @@ func LoadWithOptions(opts LoadOptions) (*Config, error) {
 		OIDCAllowedDomains:  v.GetString("OIDC_ALLOWED_DOMAINS"),
 
 		OIDCAllowUnverifiedEmail: v.GetBool("OIDC_ALLOW_UNVERIFIED_EMAIL"),
-	}
-
-	// Derive JWT secret from SECRET_KEY
-	// Try base64 decode first (for PASETO_PRIVATE_KEY compatibility), otherwise use raw bytes
-	var jwtSecret []byte
-	decoded, err := base64.StdEncoding.DecodeString(secretKey)
-	if err == nil && len(decoded) >= 32 {
-		// Valid base64-encoded key (likely from PASETO_PRIVATE_KEY backward compatibility)
-		jwtSecret = decoded
-	} else {
-		// Use raw string bytes
-		jwtSecret = []byte(secretKey)
-	}
-
-	// Warn if secret is less than recommended length
-	if len(jwtSecret) < 32 {
-		fmt.Fprintf(os.Stderr, "⚠️  WARNING: SECRET_KEY is only %d bytes. For production use, it should be at least 32 bytes (256 bits) for secure JWT signing.\n", len(jwtSecret))
-		fmt.Fprintf(os.Stderr, "   Generate a secure key with: openssl rand -base64 32\n")
 	}
 
 	// Load config values with database override logic
@@ -844,18 +982,6 @@ func LoadWithOptions(opts LoadOptions) (*Config, error) {
 		}
 	}
 
-	// Resolve + validate SMTP bridge TLS mode (only when bridge is enabled).
-	// This replaces the runtime "TLS required in production" check that used to
-	// live in pkg/smtp_bridge/server.go, moved up so startup fails early with
-	// a clear message.
-	if smtpBridgeConfig.Enabled {
-		resolved, err := resolveSMTPBridgeTLSMode(smtpBridgeConfig, v.GetString("ENVIRONMENT"))
-		if err != nil {
-			return nil, err
-		}
-		smtpBridgeConfig.TLSMode = resolved
-	}
-
 	// Telemetry and check for updates settings - env var overrides database
 	var telemetryEnabled, checkForUpdates bool
 	if isInstalled && systemSettings != nil {
@@ -884,8 +1010,24 @@ func LoadWithOptions(opts LoadOptions) (*Config, error) {
 	// derived redirect URI uses the final endpoint, and validated to fail boot fast
 	// on static misconfiguration (issuer reachability is a runtime concern).
 	oidcConfig := resolveOIDCConfig(envVals, systemSettings, isInstalled, apiEndpoint)
+	// Before either feature's own check, which would blame its settings rather than the key.
+	if err := checkUnopenedSettings(systemSettings, oidcConfig, smtpBridgeConfig, security); err != nil {
+		return nil, err
+	}
 	if err := oidcConfig.Validate(); err != nil {
 		return nil, err
+	}
+
+	// Resolve + validate SMTP bridge TLS mode (only when bridge is enabled).
+	// This replaces the runtime "TLS required in production" check that used to
+	// live in pkg/smtp_bridge/server.go, moved up so startup fails early with
+	// a clear message.
+	if smtpBridgeConfig.Enabled {
+		resolved, err := resolveSMTPBridgeTLSMode(smtpBridgeConfig, v.GetString("ENVIRONMENT"))
+		if err != nil {
+			return nil, err
+		}
+		smtpBridgeConfig.TLSMode = resolved
 	}
 
 	// Plan limits, as pushed by the Notifuse Cloud control plane. Unset means 0,
@@ -931,10 +1073,7 @@ func LoadWithOptions(opts LoadOptions) (*Config, error) {
 		SMTP:       smtpConfig,
 		SMTPBridge: smtpBridgeConfig,
 		OIDC:       oidcConfig,
-		Security: SecurityConfig{
-			JWTSecret: jwtSecret,
-			SecretKey: secretKey,
-		},
+		Security:   security,
 		Demo: DemoConfig{
 			FileManagerEndpoint:  v.GetString("DEMO_FILE_MANAGER_ENDPOINT"),
 			FileManagerBucket:    v.GetString("DEMO_FILE_MANAGER_BUCKET"),
@@ -977,6 +1116,9 @@ func LoadWithOptions(opts LoadOptions) (*Config, error) {
 			MetricsExporter: v.GetString("TRACING_METRICS_EXPORTER"),
 			PrometheusPort:  v.GetInt("TRACING_PROMETHEUS_PORT"),
 		},
+		Webhook: WebhookConfig{
+			AllowPrivateDeliveryHosts: v.GetBool("WEBHOOK_DELIVERY_ALLOW_PRIVATE_HOSTS"),
+		},
 		Broadcast: BroadcastConfig{
 			DefaultRateLimit:          v.GetInt("BROADCAST_DEFAULT_RATE_LIMIT"),
 			AllowPrivateDataFeedHosts: v.GetBool("BROADCAST_DATA_FEED_ALLOW_PRIVATE_HOSTS"),
@@ -991,7 +1133,8 @@ func LoadWithOptions(opts LoadOptions) (*Config, error) {
 			Interval:  v.GetDuration("AUTOMATION_SCHEDULER_INTERVAL"),
 			BatchSize: v.GetInt("AUTOMATION_SCHEDULER_BATCH_SIZE"),
 		},
-		Plan: planConfig,
+		EmailQueue: emailQueueConfig,
+		Plan:       planConfig,
 
 		RootEmail:        rootEmail,
 		Environment:      v.GetString("ENVIRONMENT"),
@@ -1002,6 +1145,7 @@ func LoadWithOptions(opts LoadOptions) (*Config, error) {
 		AnalyticsWorkMem: v.GetString("ANALYTICS_WORK_MEM"),
 		Version:          v.GetString("VERSION"),
 		IsInstalled:      isInstalled,
+		UnopenedSettings: unopenedSettings(systemSettings),
 		MaxUsers:         v.GetInt("MAX_USERS"),
 		MaxWorkspaces:    v.GetInt("MAX_WORKSPACES"),
 		// Read with no viper default and no validation. A default would make the key

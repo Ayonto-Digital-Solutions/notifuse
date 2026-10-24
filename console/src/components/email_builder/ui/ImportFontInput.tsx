@@ -1,6 +1,8 @@
 import React, { useState } from 'react'
 import { Input, Popover, Button, Select } from 'antd'
 import { useLingui } from '@lingui/react/macro'
+import { fontStylesheetUrl, withHttpsScheme } from '../../../utils/safeHtml'
+import { hasLiquidOutput } from '../../../utils/liquid'
 
 interface ImportFontInputProps {
   value?: {
@@ -25,19 +27,17 @@ const ImportFontInput: React.FC<ImportFontInputProps> = ({
     href: value?.href || ''
   })
 
-  const isLiquidExpression = (value: string): boolean => {
-    // Check if the value contains liquid template syntax like {{ var }}
-    return /\{\{[^}]+\}\}/.test(value)
-  }
-
   const isValidUrl = (url: string): boolean => {
-    if (!url.trim()) return false
+    // What is saved: the address trimmed
+    const href = url.trim()
+    if (!href) return false
 
     // Allow liquid expressions to bypass URL validation
-    if (isLiquidExpression(url)) return true
+    if (hasLiquidOutput(href)) return true
 
+    // A protocol-relative address is a web address, as the panel and the email read it
     try {
-      new URL(url)
+      new URL(withHttpsScheme(href))
       return true
     } catch {
       return false
@@ -181,20 +181,29 @@ const ImportFontInput: React.FC<ImportFontInputProps> = ({
   )
 
   const hasFont = value?.name && value?.href
+  const stylesheetUrl = fontStylesheetUrl(value?.href)
 
   if (hasFont) {
     return (
       <div className="flex flex-col gap-2">
         <div className="flex-1">
           <div className="text-xs font-medium text-gray-700">{value.name}</div>
-          <a
-            href={value.href}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-xs text-blue-600 hover:text-blue-800 underline break-all block leading-relaxed"
-          >
-            {value.href}
-          </a>
+          {/* A stylesheet is only ever a web address, and a Liquid one has no
+              address until the email is sent */}
+          {stylesheetUrl ? (
+            <a
+              href={stylesheetUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-xs text-blue-600 hover:text-blue-800 underline break-all block leading-relaxed"
+            >
+              {value.href}
+            </a>
+          ) : (
+            <span className="text-xs text-slate-600 break-all block leading-relaxed">
+              {value.href}
+            </span>
+          )}
         </div>
 
         <Popover

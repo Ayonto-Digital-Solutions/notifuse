@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,12 +24,14 @@ import (
 	"github.com/Notifuse/notifuse/internal/service/broadcast"
 	"github.com/Notifuse/notifuse/internal/service/queue"
 	"github.com/Notifuse/notifuse/pkg/cache"
+	pkgCrypto "github.com/Notifuse/notifuse/pkg/crypto"
 	pkgDatabase "github.com/Notifuse/notifuse/pkg/database"
 	"github.com/Notifuse/notifuse/pkg/emailerror"
 	"github.com/Notifuse/notifuse/pkg/geoip"
 	"github.com/Notifuse/notifuse/pkg/logger"
 	"github.com/Notifuse/notifuse/pkg/mailer"
 	"github.com/Notifuse/notifuse/pkg/ratelimiter"
+	"github.com/Notifuse/notifuse/pkg/safehttpclient"
 	"github.com/Notifuse/notifuse/pkg/smtp_bridge"
 	"github.com/Notifuse/notifuse/pkg/tracing"
 
@@ -66,6 +69,7 @@ type AppInterface interface {
 	GetAuthService() interface{} // Returns *service.AuthService but defined as interface{} to avoid import cycle
 	GetTransactionalNotificationService() domain.TransactionalNotificationService
 	GetEmailQueueWorker() *queue.EmailQueueWorker
+	GetEmailService() domain.EmailServiceInterface
 	GetAutomationScheduler() *service.AutomationScheduler
 	GetTaskScheduler() *service.TaskScheduler
 	GetWebAnalyticsBuffer() *service.WebAnalyticsBuffer
@@ -395,6 +399,140 @@ func (a *App) InitDB() error {
 	return nil
 }
 
+// storedDataOpens reports whether key opens the data stored under the instance key: the
+// key of at least one workspace or, when none is stored, at least one encrypted setting.
+// Nothing stored opens with any key. refusal says what the key does not open, for an
+// error that starts with the variable.
+func (a *App) storedDataOpens(ctx context.Context, key string) (opens bool, refusal string, err error) {
+	opens, examined, err := repository.SecretKeyOpensAWorkspace(ctx, a.db, key)
+	if err != nil || examined > 1 {
+		return opens, fmt.Sprintf("opens none of the %d workspaces stored in the database", examined), err
+	}
+	if examined == 1 {
+		return opens, "does not open the workspace stored in the database", nil
+	}
+	opens, tried, err := repository.SecretKeyOpensASetting(ctx, a.db, key)
+	return opens, fmt.Sprintf("opens none of the system settings stored in the database (%s), and no "+
+		"workspace is stored", strings.Join(tried, ", ")), err
+}
+
+// checkSingleSecretKey refuses a single key that opens none of the stored workspace
+// keys, as every workspace load would fail on it, or, with no workspace, none of the
+// encrypted settings, which would be dropped. A single key is used as written, so this
+// is also where quotes or a newline kept around the key show.
+func (a *App) checkSingleSecretKey(key, variable string) error {
+	ctx := context.Background()
+	opens, refusal, err := a.storedDataOpens(ctx, key)
+	if err != nil {
+		return fmt.Errorf("failed to check %s against the stored data: %w", variable, err)
+	}
+	if opens {
+		return nil
+	}
+	hint, err := a.keyHint(ctx, key, variable)
+	if err != nil {
+		return err
+	}
+	if hint != "" {
+		return fmt.Errorf("%s %s, but %s", variable, refusal, hint)
+	}
+	return fmt.Errorf("%s %s, so Notifuse cannot read its data. %s", variable, refusal,
+		config.StoredDataRemedy(variable))
+}
+
+// keyHint tries the other forms config.KeyHint names for key against the stored data,
+// stopping at the first database failure, which it returns as one.
+func (a *App) keyHint(ctx context.Context, key, variable string) (string, error) {
+	var probeErr error
+	hint := config.KeyHint(key, variable, func(candidate string) bool {
+		if probeErr != nil {
+			return false
+		}
+		opens, _, err := a.storedDataOpens(ctx, candidate)
+		probeErr = err
+		return err == nil && opens
+	})
+	if probeErr != nil {
+		return "", fmt.Errorf("failed to check %s against the stored data: %w", variable, probeErr)
+	}
+	return hint, nil
+}
+
+// warnUnopenedSettings names the system settings no key of variable opens: loading the
+// settings skips them, so Notifuse starts without them.
+func (a *App) warnUnopenedSettings(settings []string, variable string) {
+	if len(settings) == 0 {
+		return
+	}
+	a.logger.WithField("settings", settings).Warn(fmt.Sprintf("These system settings were left as they are: "+
+		"no key in %s opens them, so Notifuse starts without them. To keep them, set %s to the key they are "+
+		"encrypted with, or list that key after the first one", variable, variable))
+}
+
+// InitSecretKey brings the stored data under the first key of a SECRET_KEY that is a
+// list: what the other keys open is re-encrypted with it. A single key is only checked
+// against the stored data. It runs after the migrations, before the services start, so
+// keys that cannot open the data stop the start rather than every later workspace load.
+func (a *App) InitSecretKey() error {
+	security := a.config.Security
+	variable := security.KeyVariable
+	if variable == "" {
+		variable = "SECRET_KEY"
+	}
+	if !security.SecretKeyIsList {
+		if err := a.checkSingleSecretKey(security.SecretKey, variable); err != nil {
+			return err
+		}
+		a.warnUnopenedSettings(a.config.UnopenedSettings, variable)
+		return nil
+	}
+
+	// One instance re-encrypts at a time, and rows other sessions hold are waited for:
+	// said first, so a start that waits shows what for.
+	a.logger.Info(fmt.Sprintf("Bringing the stored data under the first key of %s; this waits for any other "+
+		"instance doing the same and for open transactions on workspaces and settings", variable))
+	result, err := repository.RotateSecretKey(context.Background(), a.db, security.SecretKey, security.PreviousSecretKeys)
+	if err != nil && !errors.Is(err, pkgCrypto.ErrUndecryptable) {
+		return fmt.Errorf("failed to bring the stored data under the first key of %s: %w", variable, err)
+	}
+	if err != nil && len(security.PreviousSecretKeys) == 0 {
+		// A list of one is a key whose commas were doubled, which docker --env-file may
+		// have kept in quotes before 42.0, as for a single key.
+		hint, probeErr := a.keyHint(context.Background(), security.SecretKey, variable)
+		if probeErr != nil {
+			return probeErr
+		}
+		if hint != "" {
+			return fmt.Errorf("%s opens no value stored in the database (%w). Nothing was changed. But %s",
+				variable, err, hint)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("no key listed in %s opens a value stored in the database (%w). Nothing was "+
+			"changed. List the key the data is encrypted with after the new one, and write each comma inside a "+
+			"key twice", variable, err)
+	}
+
+	a.warnUnopenedSettings(result.UnopenedSettings, variable)
+	if len(security.PreviousSecretKeys) == 0 {
+		a.logger.Info("The stored data opens with " + variable)
+		return nil
+	}
+	// A later start with the same list, or an instance that waited for the one that
+	// re-encrypted, finds nothing left to do.
+	message := "Stored data re-encrypted with the first key of %[1]s; once every instance runs with this %[1]s, " +
+		"set the first key alone"
+	if result.Workspaces == 0 && result.Settings == 0 {
+		message = "Nothing left to re-encrypt: the stored data already opens with the first key of %[1]s; once " +
+			"every instance runs with this %[1]s, set the first key alone"
+	}
+	a.logger.WithFields(map[string]interface{}{
+		"workspaces": result.Workspaces,
+		"settings":   result.Settings,
+	}).Info(fmt.Sprintf(message, variable))
+	return nil
+}
+
 // InitMailer initializes the mailer service
 // This method can be called multiple times to reinitialize the mailer with updated configuration
 func (a *App) InitMailer() error {
@@ -656,7 +794,12 @@ func (a *App) InitServices() error {
 		// a restart. Leaving this field out compiles and passes every unit test while SSO
 		// runs unlicensed — app_license_wiring_test.go is what notices.
 		Entitlements: a.licenseService,
-		Logger:       a.logger,
+		// Lets a pending workspace invitation provision an SSO account, and lets SSO refuse a
+		// provider that is not authoritative for an invited address. Leaving it out WIDENS
+		// access (see OIDCServiceConfig.Invitations); TestAppWiresPendingInvitationsIntoSSO
+		// is what notices.
+		Invitations: a.workspaceRepo,
+		Logger:      a.logger,
 	})
 
 	// Initialize template service
@@ -833,6 +976,7 @@ func (a *App) InitServices() error {
 		a.messageHistoryRepo,
 		a.contactRepo,
 		a.automationRepo,
+		a.listService,
 	)
 
 	// Initialize Supabase service (before workspace service)
@@ -1036,6 +1180,7 @@ func (a *App) InitServices() error {
 		a.webhookDeliveryRepo,
 		a.authService,
 		a.logger,
+		a.config.Webhook.AllowPrivateDeliveryHosts,
 	)
 
 	// Initialize automation service. It is built here, ahead of the demo service, because the demo
@@ -1045,6 +1190,7 @@ func (a *App) InitServices() error {
 		a.automationRepo,
 		a.authService,
 		a.logger,
+		a.config.Webhook.AllowPrivateDeliveryHosts,
 	)
 
 	// Initialize demo service
@@ -1076,6 +1222,7 @@ func (a *App) InitServices() error {
 		a.annotationRepo,
 		a.webhookSubscriptionService,
 		a.automationService,
+		a.authService,
 	)
 
 	// Initialize telemetry service
@@ -1167,13 +1314,23 @@ func (a *App) InitServices() error {
 		a.logger,
 	)
 
-	// Initialize webhook delivery worker
+	// Initialize webhook delivery worker.
+	//
+	// It gets its own SSRF-protected client rather than the shared one above: a
+	// subscription's URL is supplied by whoever holds webhook_subscriptions:write.
+	// See newOutgoingWebhookClient, which automation webhook nodes share.
+	//
+	// Its 10s timeout matches the shared client's, so the claim lease the worker
+	// derives from it in normaliseTimings is unchanged.
+	if a.config.Webhook.AllowPrivateDeliveryHosts {
+		a.logger.Warn("WEBHOOK_DELIVERY_ALLOW_PRIVATE_HOSTS is enabled: outgoing webhooks (subscriptions and automation webhook nodes) may reach private and internal addresses")
+	}
 	a.webhookDeliveryWorker = service.NewWebhookDeliveryWorker(
 		a.webhookSubscriptionRepo,
 		a.webhookDeliveryRepo,
 		a.workspaceRepo,
 		a.logger,
-		httpClient,
+		newOutgoingWebhookClient(a.config.Webhook.AllowPrivateDeliveryHosts, a.config.Tracing.Enabled, 10*time.Second),
 	)
 
 	// Initialize email queue worker for processing marketing emails (broadcasts & automations)
@@ -1183,7 +1340,7 @@ func (a *App) InitServices() error {
 		a.workspaceRepo,
 		a.emailService,
 		a.messageHistoryRepo,
-		queue.DefaultWorkerConfig(),
+		newEmailQueueWorkerConfig(a.config),
 		a.logger,
 	)
 	// Enable the stop-on-reply just-in-time guard for automation sends.
@@ -1233,6 +1390,10 @@ func (a *App) InitServices() error {
 		a.contactTimelineRepo,
 		a.logger,
 		a.config.APIEndpoint,
+		// Webhook nodes post to a URL whoever holds automations:write typed, so they
+		// take the same guard and opt-out as subscriptions. 30s is the node's
+		// timeout from before it had a guard.
+		newOutgoingWebhookClient(a.config.Webhook.AllowPrivateDeliveryHosts, a.config.Tracing.Enabled, 30*time.Second),
 	)
 	a.automationScheduler = service.NewAutomationScheduler(
 		automationExecutor,
@@ -1303,6 +1464,41 @@ func (a *App) InitServices() error {
 	return nil
 }
 
+// newEmailQueueWorkerConfig is the email queue worker's default configuration with the
+// deployment's sending concurrency.
+func newEmailQueueWorkerConfig(cfg *config.Config) *queue.EmailQueueWorkerConfig {
+	workerConfig := queue.DefaultWorkerConfig()
+	workerConfig.SendConcurrency = cfg.EmailQueue.Concurrency
+	workerConfig.SMTPSendConcurrency = cfg.EmailQueue.SMTPConcurrency
+	return workerConfig
+}
+
+// newOutgoingWebhookClient builds the client for requests to a URL a workspace
+// member supplied: webhook subscription deliveries and automation webhook nodes.
+//
+// Without a guard either one is a request-forgery primitive aimed at whatever
+// the server can reach, and both hand the response back — the subscription test
+// endpoint and delivery log, and the node executions an automation stores.
+// safehttpclient validates the resolved address at dial time, on the first hop
+// and on every redirect, which is what closes the POST-to-GET downgrade a 302
+// would otherwise buy. allowPrivateHosts is WEBHOOK_DELIVERY_ALLOW_PRIVATE_HOSTS,
+// for deployments that deliberately deliver to their own network.
+//
+// Tracing wraps the client after the guard is chosen, so it wraps the guard
+// rather than replacing it: WrapHTTPClient keeps the base transport, and with it
+// the safe DialContext.
+func newOutgoingWebhookClient(allowPrivateHosts, tracingEnabled bool, timeout time.Duration) *http.Client {
+	client := safehttpclient.New()
+	if allowPrivateHosts {
+		client = &http.Client{}
+	}
+	client.Timeout = timeout
+	if tracingEnabled {
+		client = tracing.WrapHTTPClient(client)
+	}
+	return client
+}
+
 // InitHandlers initializes all HTTP handlers and routes
 func (a *App) InitHandlers() error {
 	// Create a new ServeMux to avoid route conflicts on restart
@@ -1351,6 +1547,7 @@ func (a *App) InitHandlers() error {
 		// or from staying hidden after a key was pasted, which needs no restart.
 		a.oidcService.IsEnabled,
 		a.config.OIDC.ButtonLabel,
+		a.config.Webhook.AllowPrivateDeliveryHosts,
 	)
 	setupHandler := httpHandler.NewSetupHandler(
 		a.setupService,
@@ -1520,12 +1717,12 @@ func (a *App) InitHandlers() error {
 	return nil
 }
 
-// Start starts the HTTP server
-func (a *App) Start() error {
-	// Create server with wrapped handler for CORS and tracing
+// serverHandler wraps the app's routes in the middleware every request goes
+// through: graceful shutdown, tracing when enabled, and CORS.
+func (a *App) serverHandler() http.Handler {
 	var handler http.Handler = a.GetHandler()
 
-	// Apply graceful shutdown middleware first (outermost)
+	// Apply graceful shutdown middleware first (innermost)
 	handler = a.gracefulShutdownMiddleware(handler)
 	a.logger.Info("Graceful shutdown middleware enabled")
 
@@ -1537,6 +1734,35 @@ func (a *App) Start() error {
 
 	// Apply CORS middleware
 	handler = middleware.CORSMiddleware(handler)
+
+	// Outermost, so the webhooks reach the server's own writer for their body
+	// limits whatever wraps it further in
+	return middleware.KeepServerWriter(handler)
+}
+
+// newHTTPServer builds the HTTP server with its connection time limits.
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:    addr,
+		Handler: handler,
+		// Bounds the TLS handshake and the request headers. net/http lifts it
+		// once the headers are read, so it never limits a body or a handler.
+		ReadHeaderTimeout: 20 * time.Second,
+		// Longer than the idle reuse of the proxies Notifuse runs behind, up to
+		// the largest an AWS load balancer accepts (4000 s) and Envoy's default
+		// (1 h), so the proxy always closes an idle connection first and never
+		// sends a request on one being closed here.
+		IdleTimeout: 70 * time.Minute,
+		// No ReadTimeout or WriteTimeout: they would cut streamed responses (LLM
+		// chat, setup wizard, audit export) and large request bodies on slow
+		// links. The public webhooks bound their own bodies.
+	}
+}
+
+// Start starts the HTTP server
+func (a *App) Start() error {
+	// Create server with wrapped handler for CORS and tracing
+	handler := a.serverHandler()
 
 	addr := fmt.Sprintf("%s:%d", a.config.Server.Host, a.config.Server.Port)
 	a.logger.WithField("address", addr).
@@ -1553,10 +1779,7 @@ func (a *App) Start() error {
 	a.serverStarted = make(chan struct{})
 
 	// Create the server
-	a.server = &http.Server{
-		Addr:    addr,
-		Handler: handler,
-	}
+	a.server = newHTTPServer(addr, handler)
 
 	// Get a reference to the channel before unlocking
 	serverStarted := a.serverStarted
@@ -1987,6 +2210,10 @@ func (a *App) Initialize() error {
 		return err
 	}
 
+	if err := a.InitSecretKey(); err != nil {
+		return err
+	}
+
 	// Check if setup wizard is required (after migrations have run)
 	var installedValue string
 	err := a.db.QueryRow("SELECT value FROM settings WHERE key = 'is_installed'").Scan(&installedValue)
@@ -2021,11 +2248,12 @@ func (a *App) Initialize() error {
 
 	a.logger.Info("Application successfully initialized")
 
-	// Send startup telemetry metrics
-	if a.telemetryService != nil {
+	// Send startup telemetry metrics. The goroutine keeps its own reference: a restart
+	// in the same process sets the field again while it may still run.
+	if telemetry := a.telemetryService; telemetry != nil {
 		go func() {
 			ctx := context.Background()
-			if err := a.telemetryService.SendMetricsForAllWorkspaces(ctx); err != nil {
+			if err := telemetry.SendMetricsForAllWorkspaces(ctx); err != nil {
 				a.logger.WithField("error", err).Error("Failed to send startup telemetry metrics")
 			}
 		}()
@@ -2130,6 +2358,10 @@ func (a *App) GetTaskRepository() domain.TaskRepository {
 
 func (a *App) GetEmailQueueWorker() *queue.EmailQueueWorker {
 	return a.emailQueueWorker
+}
+
+func (a *App) GetEmailService() domain.EmailServiceInterface {
+	return a.emailService
 }
 
 func (a *App) GetAuthService() interface{} {

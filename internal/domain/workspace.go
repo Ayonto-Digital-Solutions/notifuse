@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Notifuse/notifuse/pkg/crypto"
 	"github.com/asaskevich/govalidator"
@@ -605,9 +606,14 @@ func (ws *WorkspaceSettings) Validate(passphrase string) error {
 // Note: this falls back to the API endpoint. The blog/public-site origin uses a
 // different fallback (Custom Endpoint URL → Website URL); do not use this method
 // for blog URL composition.
+//
+// The Custom Endpoint URL is stored as typed, so trailing slashes are trimmed here, as
+// API_ENDPOINT's are at boot: every caller appends "/path", and "https://host//path"
+// is answered with a redirect - which a List-Unsubscribe URL must never return
+// (RFC 8058 section 3.1).
 func (ws *WorkspaceSettings) ResolveEndpoint(apiEndpoint string) string {
 	if ws.CustomEndpointURL != nil && *ws.CustomEndpointURL != "" {
-		return *ws.CustomEndpointURL
+		return strings.TrimRight(*ws.CustomEndpointURL, "/")
 	}
 	return apiEndpoint
 }
@@ -677,17 +683,39 @@ type Workspace struct {
 	UpdatedAt    time.Time         `json:"updated_at"`
 }
 
+// validateWorkspaceID checks the ID of a workspace being created or saved against the
+// workspace ID columns, VARCHAR(20).
+func validateWorkspaceID(id string) error {
+	if id == "" {
+		return fmt.Errorf("id is required")
+	}
+	if !govalidator.IsAlphanumeric(id) {
+		return fmt.Errorf("id must be alphanumeric")
+	}
+	if len(id) > 20 {
+		return fmt.Errorf("id length must be between 1 and 20")
+	}
+	return nil
+}
+
+// ValidateNewWorkspaceID checks the ID of a workspace about to be created. On top of
+// validateWorkspaceID it requires lowercase: the workspace database is created under the
+// lowercase form of its name, so an ID with an uppercase letter names a database that does
+// not exist. Workspace.Validate leaves case alone, as it also runs on every update.
+func ValidateNewWorkspaceID(id string) error {
+	if err := validateWorkspaceID(id); err != nil {
+		return err
+	}
+	if id != strings.ToLower(id) {
+		return fmt.Errorf("id must contain only lowercase letters and digits")
+	}
+	return nil
+}
+
 // Validate performs validation on the workspace fields
 func (w *Workspace) Validate(passphrase string) error {
-	// Validate ID
-	if w.ID == "" {
-		return fmt.Errorf("invalid workspace: id is required")
-	}
-	if !govalidator.IsAlphanumeric(w.ID) {
-		return fmt.Errorf("invalid workspace: id must be alphanumeric")
-	}
-	if len(w.ID) > 32 {
-		return fmt.Errorf("invalid workspace: id length must be between 1 and 32")
+	if err := validateWorkspaceID(w.ID); err != nil {
+		return fmt.Errorf("invalid workspace: %w", err)
 	}
 
 	// Validate Name
@@ -975,19 +1003,41 @@ func ScanWorkspace(scanner interface {
 		CreatedAt: dbw.CreatedAt,
 		UpdatedAt: dbw.UpdatedAt,
 	}
+	if err := w.decodeStored(dbw.Settings, dbw.Integrations); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
 
-	if err := json.Unmarshal(dbw.Settings, &w.Settings); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal settings: %w", err)
+// decodeStored reads the settings and integrations columns of a workspace row.
+func (w *Workspace) decodeStored(settings, integrations []byte) error {
+	if err := json.Unmarshal(settings, &w.Settings); err != nil {
+		return fmt.Errorf("failed to unmarshal settings: %w", err)
 	}
 
 	// Unmarshal integrations if present
-	if len(dbw.Integrations) > 0 {
-		if err := json.Unmarshal(dbw.Integrations, &w.Integrations); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal integrations: %w", err)
+	if len(integrations) > 0 {
+		if err := json.Unmarshal(integrations, &w.Integrations); err != nil {
+			return fmt.Errorf("failed to unmarshal integrations: %w", err)
 		}
 	}
+	return nil
+}
 
-	return w, nil
+// CheckStoredWorkspace opens the settings and integrations a workspace row holds as
+// loading it does, with AfterLoad under globalSecretKey. It fails with
+// crypto.ErrUndecryptable when the key does not open a value the workspace uses (its
+// key, its file storage key, the credentials of each integration's active provider), so
+// every load of the row would fail; values nothing reads are not checked.
+func CheckStoredWorkspace(settings, integrations []byte, globalSecretKey string) error {
+	var w Workspace
+	if err := w.decodeStored(settings, integrations); err != nil {
+		return err
+	}
+	if err := w.AfterLoad(globalSecretKey); err != nil {
+		return fmt.Errorf("%w: %v", crypto.ErrUndecryptable, err)
+	}
+	return nil
 }
 
 // UserWorkspace represents the relationship between a user and a workspace
@@ -1070,6 +1120,17 @@ type WorkspaceInvitation struct {
 	UpdatedAt   time.Time       `json:"updated_at"`
 }
 
+// PendingInvitation is a live invitation as its invitee sees it: the workspace it opens
+// and who sent it. It carries no permissions — the invitee joins with whatever the owner
+// granted, and the console has no use for the grant before then.
+type PendingInvitation struct {
+	ID            string    `json:"id"`
+	WorkspaceID   string    `json:"workspace_id"`
+	WorkspaceName string    `json:"workspace_name"`
+	InviterName   string    `json:"inviter_name,omitempty"`
+	ExpiresAt     time.Time `json:"expires_at"`
+}
+
 type WorkspaceRepository interface {
 	Create(ctx context.Context, workspace *Workspace) error
 	GetByID(ctx context.Context, id string) (*Workspace, error)
@@ -1095,13 +1156,27 @@ type WorkspaceRepository interface {
 	UpdateUserWorkspacePermissions(ctx context.Context, userWorkspace *UserWorkspace) error
 
 	// Workspace invitation management
+	// CreateInvitation upserts on (workspace_id, email). An existing row for the address,
+	// pending or expired, keeps its id and created_at, and both are written back onto
+	// invitation — so invitation.ID can differ from the one passed in.
 	CreateInvitation(ctx context.Context, invitation *WorkspaceInvitation) error
 	GetInvitationByID(ctx context.Context, id string) (*WorkspaceInvitation, error)
+	// GetInvitationByEmail matches email case-insensitively, expired invitations included;
+	// none is ErrInvitationNotFound.
 	GetInvitationByEmail(ctx context.Context, workspaceID, email string) (*WorkspaceInvitation, error)
 	GetWorkspaceInvitations(ctx context.Context, workspaceID string) ([]*WorkspaceInvitation, error)
 	DeleteInvitation(ctx context.Context, id string) error
+	// DeleteInvitationByEmail deletes the workspace's invitations for email, matched
+	// case-insensitively; none is not an error.
+	DeleteInvitationByEmail(ctx context.Context, workspaceID, email string) error
+	// ListPendingInvitationsForEmail returns the live invitations addressed to email,
+	// matched case-insensitively, the newest one per workspace.
+	ListPendingInvitationsForEmail(ctx context.Context, email string) ([]*PendingInvitation, error)
 	IsUserWorkspaceMember(ctx context.Context, userID, workspaceID string) (bool, error)
-	CountWorkspaceMembersAndInvitations(ctx context.Context, workspaceID string) (int, error)
+	// CountWorkspaceMembersAndInvitations counts human members plus live invitations, leaving
+	// out the invitations addressed to excludeEmail, matched case-insensitively ("" leaves
+	// out none).
+	CountWorkspaceMembersAndInvitations(ctx context.Context, workspaceID, excludeEmail string) (int, error)
 	CountWorkspaces(ctx context.Context) (int, error)
 
 	// Database management
@@ -1118,6 +1193,19 @@ type WorkspaceRepository interface {
 // row for a workspace. Callers (e.g. the platform-admin override in AuthService) use
 // errors.Is to distinguish a plain "not a member" from a real database failure.
 var ErrUserNotInWorkspace = errors.New("user is not a member of the workspace")
+
+// ErrInvitationNotFound is returned (errors.Is-able) when no invitation has the id asked for.
+var ErrInvitationNotFound = errors.New("invitation not found")
+
+// ErrInvitationUnavailable is what a user is told about an invitation they cannot join or
+// accept: missing, expired, addressed to someone else or offered to an API key all read the
+// same, so an invitation id is not something to probe with.
+var ErrInvitationUnavailable = errors.New("invitation not found or no longer valid")
+
+// ErrStaleCredential is returned when a workspace would be saved with a credential the
+// instance secret key does not open: an API client that read the workspace before a
+// SECRET_KEY rotation may send back the encrypted forms it read, under the former key.
+var ErrStaleCredential = errors.New("the saved credentials of this workspace changed")
 
 // ErrUnauthorized is returned when a user is not authorized to perform an action
 type ErrUnauthorized struct {
@@ -1176,6 +1264,10 @@ type WorkspaceServiceInterface interface {
 	GetInvitationByID(ctx context.Context, invitationID string) (*WorkspaceInvitation, error)
 	AcceptInvitation(ctx context.Context, invitationID, workspaceID, email string) (*AuthResponse, error)
 	DeleteInvitation(ctx context.Context, invitationID string) error
+	// ListPendingInvitations and JoinInvitation are the signed-in counterpart of the emailed
+	// link: the invitations addressed to the caller's email, and joining one of them.
+	ListPendingInvitations(ctx context.Context) ([]*PendingInvitation, error)
+	JoinInvitation(ctx context.Context, invitationID string) (workspaceID string, err error)
 
 	// Integration management
 	CreateIntegration(ctx context.Context, req CreateIntegrationRequest) (string, error)
@@ -1423,22 +1515,16 @@ type CreateWorkspaceRequest struct {
 }
 
 func (r *CreateWorkspaceRequest) Validate(passphrase string) error {
-	// Validate ID
-	if r.ID == "" {
-		return fmt.Errorf("invalid create workspace request: id is required")
-	}
-	if !govalidator.IsAlphanumeric(r.ID) {
-		return fmt.Errorf("invalid create workspace request: id must be alphanumeric")
-	}
-	if len(r.ID) > 32 {
-		return fmt.Errorf("invalid create workspace request: id length must be between 1 and 32")
+	if err := ValidateNewWorkspaceID(r.ID); err != nil {
+		return fmt.Errorf("invalid create workspace request: %w", err)
 	}
 
 	// Validate Name
 	if r.Name == "" {
 		return fmt.Errorf("invalid create workspace request: name is required")
 	}
-	if len(r.Name) > 32 {
+	// Counted in characters, like the console's counter on this field.
+	if utf8.RuneCountInString(r.Name) > 32 {
 		return fmt.Errorf("invalid create workspace request: name length must be between 1 and 32")
 	}
 
@@ -1562,7 +1648,7 @@ func (r *UpdateWorkspaceRequest) Validate(passphrase string) error {
 	if r.Name == "" {
 		return fmt.Errorf("invalid update workspace request: name is required")
 	}
-	if len(r.Name) > 32 {
+	if utf8.RuneCountInString(r.Name) > 32 {
 		return fmt.Errorf("invalid update workspace request: name length must be between 1 and 32")
 	}
 

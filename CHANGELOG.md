@@ -2,6 +2,118 @@
 
 All notable changes to this project will be documented in this file.
 
+## [42.0] - 2026-10-23
+
+- **Security**: Webhook subscriptions and automation webhook nodes now refuse private, loopback, link-local and reserved addresses, when the URL is saved and when it is called.
+
+  **If your webhooks reach a service on your own network — n8n or another container on the same Docker network, an internal API — set `WEBHOOK_DELIVERY_ALLOW_PRIVATE_HOSTS=true` before you upgrade.** Until it is set, those webhooks stop delivering, and a contact that reaches such a webhook node fails that journey after its retries.
+
+- **Security**: Email provider webhooks now only act on emails Notifuse sent to the address each event names. Other events are ignored and no longer listed in the Email Provider Webhooks logs, and soft bounces already recorded count towards the bounce threshold on the same terms. **If a relay of yours posts events for an SMTP integration to `/webhooks/email`, set each event's `message_id` to the email's `X-Message-ID` header and its `recipient` to the address the email was sent to.**
+
+- **Security**: The email editor now displays template content without running its scripts, email and blog theme previews run in a sandbox, and a contact's page views only open pages of the workspace website or of a domain listed in web analytics settings.
+
+- **Security**: Email provider event webhooks (`/webhooks/email`) and the Supabase hooks now refuse bodies over 10 MiB and 1 MiB, far above what providers send, or that take more than 30 seconds to arrive, and the server now closes connections that take more than 20 seconds to send their headers or stay idle for 70 minutes. Each event of a SendGrid, SparkPost or Mailjet batch now keeps only its own payload in the webhook event log.
+
+- **Security**: Workspace databases are now only created for existing workspaces, under a name that is always checked and quoted.
+
+- **Security**: `SECRET_KEY` can now list several keys separated by commas, to replace it: the first key encrypts and signs, and when Notifuse starts it re-encrypts with that key the stored data the other keys open. Notifuse no longer starts when that first key is the `SECRET_KEY` value `compose.yaml` used to provide by default, the `env.example` placeholder or shorter than 32 bytes, or when `SECRET_KEY` cannot open the stored data (none of the stored workspaces or, before the first workspace, none of the encrypted system settings; or a stored setting that single sign-on or the SMTP bridge needs), and `compose.yaml` now requires `SECRET_KEY`. Tokens are also checked against the kind of account they were issued for, the system settings answer only a session that is still signed in, and an invitation link only opens the workspace and address it was sent for, until it expires. The address of an API key can no longer be invited, and API responses no longer include a workspace's encrypted secret key.
+
+  **If your `SECRET_KEY` is one of those values or shorter than 32 bytes, including when a tool such as Coolify copied the `compose.yaml` default into your settings: in the same step as the upgrade, generate a key with `openssl rand -base64 32` and set `SECRET_KEY=<new key>,<current key>`, writing twice any comma your current key contains.** An earlier version would read the list as a single key. Stop every instance, then start them all on 42.0 with it; once they all run, set the new key alone, without quotes or spaces around it. If you never set `SECRET_KEY`, your current key is the former default, which the installation guide gives. Setting the new key without your current key after it would leave your stored data unreadable. Everyone then signs in again, API keys must be deleted and created again, pending invitations must be sent again, and scripts that call `user.rootSignin` or `demo.reset` sign with the new key.
+
+  **If your `SECRET_KEY` contains a comma, write each of its commas twice in the same step as the upgrade**: Notifuse now reads a single comma as a separator between keys.
+
+- **Fix**: Audit log entries for workspace actions now carry the actor's name, and actions taken with an API key are recorded with the `api_key` actor type. Entries recorded before the upgrade are unchanged.
+
+- **Improvement**: In the email editor, a raw HTML block now shows the fonts imported in the template, and all of its content when its column changes width.
+
+- **Improvement**: An invitation link that was already accepted, cancelled or has expired now says the invitation is no longer valid, instead of failing with an error or signing out the person who opened it.
+
+- **Improvement**: Web analytics goals tracked with numbers or booleans in `properties`, or a numeric string `value` such as `'49.90'`, are now recorded along with the rest of the visit. `trackGoal` converts these before sending, and skips, with a console warning, a goal it can't convert or that exceeds a limit.
+
+- **Security**: On a UTF-8 database, web analytics no longer drops the visits it receives alongside a visit holding text, a goal value or a session id the database can't store. Such a visit is now kept, less any page view or goal that can't be stored, with its other details in a form the database accepts.
+
+- **Fix**: On PostgreSQL servers that report errors in a language other than English, web analytics now creates a missing monthly partition, as it already did on English ones, instead of dropping the visits dated in that month along with the other visits written with them.
+
+- **Improvement**: The blog API (categories, posts and themes) is now in the API reference. `blogPosts.list` pages with `page` and `limit` (not `offset`), and a missing blog permission answers 403.
+
+- **Fix**: An email's `List-Unsubscribe` link opened in a browser now leads to the notification center, which asks the contact to confirm (#450). One-click unsubscribe also accepts `multipart/form-data`.
+
+- **Improvement**: A Custom Endpoint URL saved with a trailing slash no longer adds `//` to tracking, unsubscribe and notification center links.
+
+- **Improvement**: Links whose URL contains an apostrophe or a double quote, such as `…/blog/what's-new` or a link personalised with a name like O'Brien, now take recipients where they point, with or without click tracking, as do links that encode a character, such as the `&#038;` WordPress writes for `&`. A code-mode link whose URL holds `&quot;` or `&#X27;` no longer fails to compile.
+
+- **Fix**: Unsubscribing from an automation email now works for contacts who aren't on the automation's list, and for emails sent before the contact or its list was deleted.
+
+- **Fix**: Unsubscribes reported by Mailjet are now recorded as unsubscribes instead of spam complaints: the email counts as unsubscribed rather than complained, and `email.unsubscribed` is sent instead of `email.complained`. When the email was sent for a list, the contact is also unsubscribed from that list by the rules of its unsubscribe link (for an automation email queued before this version, the automation's current list). The webhook event log, the contact timeline and the integration's webhook status show these events as unsubscribes, with no need to register the webhooks again; unsubscribes reported before the upgrade stay complaints.
+
+- **Improvement**: A list can no longer be deleted while a live automation uses it for its emails, adds contacts to it or is triggered by it. `lists.delete` then answers `409` naming those automations (a member or API key that can't see automations is only told how many): pause them first. An automation that uses a deleted or missing list in one of these ways can't be activated, and a live one can't be saved while it still does. If saving a live automation fails and its previous version can't be put back live, the automation is now paused when it can be, and the error says what state it was left in.
+
+- **Fix**: Spam complaints on automation emails, and hard bounces from contacts who were never on the automation's list, are now recorded on that list, so the list's broadcasts and the marketing and blog emails of its automations no longer reach that address. This covers automation emails queued from this version on, which carry their list in the message log and in `email.*` webhook events. A `list.complained` or `list.bounced` event is recorded too, unless the contact was removed from the list. Contacts who were never on it now appear there as `complained` or `bounced`, and match its "in list" segment conditions that don't filter on status.
+
+- **Improvement**: Spam complaints and hard bounces are less likely to be lost, or to make part of an import fail, when they arrive while the same contacts are being imported or subscribed. The conditions of automations triggered by `email.complained` or `email.bounced` now see the list status the complaint or bounce set.
+
+- **Improvement**: A contact removed from a list now stays removed when they unsubscribe, and changes to their status no longer trigger `list.*` events. A hard bounce now also marks the lists a contact was removed from, so they can't be added back to them, as when the bounce came before the removal. Subscribing a removed contact again after an unsubscribe, from the subscribe form, the notification center or `lists.subscribe`, now asks for double opt-in, as for a contact on the list, and the subscribe form no longer sends a confirmation email to a removed contact who bounced or complained.
+
+- **Fix**: Broadcasts created through the API without `exclude_unsubscribed` now leave out unsubscribed contacts, as in the console. Bounced and complained contacts are always left out, and unsubscribing keeps an existing bounce or complaint. Broadcasts created before the upgrade keep their saved setting.
+
+- **Security**: Contacts can no longer join a private list from the notification center: they can only leave the private lists they are on. The page no longer shows private lists they left or were removed from, nor a public list they were removed from as one they are on. Integrations that used `/subscribe` with an `email_hmac` to add contacts to private lists must use `lists.subscribe` instead.
+
+- **Fix**: Liquid typed in the visual editor is now kept as typed (#438), and templates saved with curled quotes, `≠` or `&gt;` in their Liquid are repaired when they render. A comparison that now runs may show Liquid's type error, such as a number compared with a quoted value (`> "100"`): remove the quotes.
+
+- **Improvement**: In the visual editor, block attributes, such as an image's alt or title text, can now contain `"` and `<`.
+
+- **Security**: Liquid inside contact data, data-feed values or API-provided data is now rendered as plain text when a visual-editor email is compiled. A single render's output is capped at 10 MB.
+
+- **Fix**: Resending a workspace invitation now sends a working link (#436). Inviting an address again refreshes its pending invitation instead of adding a second one, and accepting finds the invitee's existing account whatever the letter case.
+
+- **Improvement**: Invited users can sign in with SSO before opening their invitation (#436). Their first SSO sign-in creates the account, even in invited-only mode or outside `OIDC_ALLOWED_DOMAINS`, and the workspace list shows their pending invitations with a **Join** button. This needs an identity provider that vouches for the address (`email_verified`; from Google, only for a Gmail or Workspace address; from Microsoft Entra ID, `xms_edov` for a member of your tenant); otherwise SSO creates no account for an invited address, even with `OIDC_AUTO_CREATE_USERS`, and the invitee uses the emailed link. A sign-in refused by the domain allowlist now says so.
+
+- **Improvement**: Signed-in users other than the root user who belong to no workspace now see the workspace list instead of the workspace creation form.
+
+- **Improvement**: The notification center now saves a contact's browser language and timezone on their first interaction rather than on page load, so email security scanners that only open the page no longer change them.
+
+- **Security**: Dependency updates clear the open Dependabot and `npm audit` advisories that have a fix, including `dompurify` 3.4.17 and `seroval` 1.6.9 in the console, and `vite` 7.3.7 and 8.3.3 for advisories in its development server. `braces` and `katex` stay open until a usable fixed version exists.
+
+- **Security**: The server is now built with Go 1.26.10, which fixes vulnerabilities in its HTTP/1 and HTTP/2 handling, MIME parsing, TLS, certificate verification and HTML templates. Building from source now requires Go 1.26.10 or later; if a Docker build stops with “go.mod requires go >= 1.26.10”, run it again with `--pull` (for example `docker compose build --pull`).
+
+- **Improvement**: Signing in after moving an instance to a new domain now explains the fix: set `API_ENDPOINT` to the new address and restart (#435). The self-hosting docs gain a "Changing your domain" page.
+
+- **Improvement**: `CORS_ALLOW_ORIGIN` now accepts a comma-separated list of origins, as documented.
+
+- **Improvement**: `templates.update` on a deleted template now answers `404` and leaves it deleted (#442).
+
+- **Improvement**: Creating a template with the ID of a deleted template now says why it is refused, and `templates.get` returns `deleted_at`. The template editor says that the editor mode can't be changed after creation (#442).
+
+- **Improvement**: "Detect from website URL" now only picks a logo that loads as an image (#432).
+
+- **Fix**: A contact removed from a list is now treated as off the list everywhere: broadcasts, segments, automation conditions and nodes, the API's `contact_lists` and a template's `contact.contact_lists`. Upgrading updates existing segments and live automations, and affected contacts get one `segment.left` or `segment.joined` event per segment.
+
+- **Improvement**: Adding a removed contact back to a list with the status they had now records `list.subscribed` (or `list.pending` while awaiting double opt-in) on their timeline and as a webhook event, so "every time" automations triggered by it enroll them again, imports included. A re-add that moves them to awaiting double opt-in now sends `list.pending` as a webhook event too. Removing a contact who is already removed records nothing.
+
+- **Improvement**: Webhooks now receive `list.pending` when a contact who unsubscribed from a list subscribes again and has to confirm, as their timeline already showed. Until now, webhooks heard of them again only when they confirmed. A status change to pending from the console, the API or an automation's Add to List node sends it too, with the status the contact came from in `previous_status`.
+
+- **Fix**: A broadcast filtered by several segments now sends one email to a contact who belongs to more than one of them, where it could send one per segment. Such a contact also counted as several recipients in the broadcast's totals and in its A/B test.
+
+- **Improvement**: Broadcasts to large lists are faster to send. Fetching each batch of recipients no longer rereads the part of the list already sent.
+
+- **Fix**: When an A/B test's winner is picked by hand, the rest of the list now receives only the winning variation.
+
+- **Improvement**: A broadcast now reaches each contact once when its A/B winner is picked through the API during the test phase, or when it is paused and resumed while a batch is being prepared.
+
+- **Improvement**: A broadcast whose sending keeps failing is now marked failed once its last retry has failed, instead of one attempt early while that retry went on to send to the rest of the list. A pause made during that last attempt is kept.
+
+- **Improvement**: Telemetry, when switched on, now also reports whether a workspace uses SendGrid.
+
+- **Improvement**: Broadcasts and automation emails now go out at the rate limit set on their email integration. Each email integration sends up to 10 emails at once (1 over SMTP), where a workspace sent one at a time and never more than 3,000 per minute, and the queue is fetched without sorting its whole backlog each time. Keep the limit at or below what your provider accepts, minus your transactional traffic. `EMAIL_QUEUE_CONCURRENCY` and `EMAIL_QUEUE_SMTP_CONCURRENCY` set the number of simultaneous sends.
+
+- **Improvement**: Restarting Notifuse during a broadcast now lets the emails being sent finish instead of sending them again after the restart. When a provider failure pauses broadcasts, the emails being sent at that moment are paused with the rest, and the integration's other queued emails, such as automation emails, go out again after the cooldown, starting with a single test email. An integration with a low rate limit no longer holds up the sends of other workspaces.
+
+- **Improvement**: With several Notifuse instances on the same database, an email that one instance has just failed or given up on is no longer sent again straight away by another.
+
+- **Improvement**: Template names can now be up to 255 characters (#463), and an accented letter in a template or workspace name counts as one character. The console shows the limit of the name and ID fields of templates, transactional notifications and workspaces as you type, and an ID filled in from a long name now fits its limit. The API now refuses with the reason (400) a transactional notification whose ID is over 32 characters or whose name is over 255, and a new workspace whose ID is over 20 characters or has uppercase letters.
+
+- **Change**: The database schema moves to v42. Workspace databases get updated `contact_lists` and `message_history` trigger functions, and their stored segment queries and live automation triggers are updated in place; segments are re-evaluated for contacts removed from their lists. The system database is untouched.
+
 ## [41.0] - 2026-09-17
 
 - **Feature**: Audit logs. Logs → Audit logs shows who did what in a workspace — a member invited, a permission set changed, an API key created, an integration edited, a template saved, a broadcast scheduled, a contact deleted — with the address it came from, the request it belonged to, and whether it succeeded, failed or was refused. The security-sensitive entries carry a before/after of what changed, with every password, secret and key replaced by `[redacted]`; the fact that they changed is kept, the values are not. Failures are recorded too: a sign-in for an unknown address, a wrong or expired code, a request refused by a permission check or by the licence, each with the reason the response deliberately does not give away. What is never recorded is the data plane — contact upserts, sends, tracking, custom events — which belongs in Logs, not in a trail.

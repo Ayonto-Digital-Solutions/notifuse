@@ -15,7 +15,8 @@ import {
   faFlagCheckered,
   faReply,
   faRobot,
-  faGlobe
+  faGlobe,
+  faBan
 } from '@fortawesome/free-solid-svg-icons'
 import { faUser, faFolderOpen, faPaperPlane, faEye } from '@fortawesome/free-regular-svg-icons'
 import {
@@ -33,8 +34,48 @@ import TemplatePreviewDrawer from '../templates/TemplatePreviewDrawer'
 import { getProviderIcon } from '../integrations/EmailProviders'
 import { formatValue, formatEventName, getSourceBadge } from '../../utils/formatters'
 import { WebPageDrawer } from './WebPageDrawer'
+import { safeExternalUrl } from '../../utils/safeHtml'
 
 const { Text } = Typography
+
+// Whether a hostname is one of the web analytics allowed domains, read the way
+// the server reads them for incoming visits: case and spaces ignored, an IPv6
+// address compared without its brackets, a numeric port dropped (`[::1]:8080`
+// is `::1`), and `*.example.com` covering example.com and its subdomains but
+// never a bare TLD.
+const isTrackedHost = (hostname: string, allowedDomains: string[]): boolean => {
+  const host = hostname.toLowerCase().replace(/^\[(.*)\]$/, '$1')
+  return allowedDomains.some((entry) => {
+    const trimmed = entry.trim().toLowerCase()
+    const withPort = /^\[(.*)\]:\d+$/.exec(trimmed) ?? /^([^:]*):\d+$/.exec(trimmed)
+    const allowed = withPort ? withPort[1] : trimmed
+    if (!allowed) return false
+    if (allowed.startsWith('*.')) {
+      const wild = allowed.slice(2)
+      return wild.includes('.') && (host === wild || host.endsWith(`.${wild}`))
+    }
+    return host === allowed
+  })
+}
+
+// The workspace website, whose address the settings accept with or without
+// its scheme (`example.com`)
+const parseWebsiteURL = (websiteURL?: string): URL | null => {
+  const address = websiteURL?.trim()
+  if (!address) return null
+  try {
+    return new URL(/^https?:\/\//i.test(address) ? address : `https://${address}`)
+  } catch {
+    return null
+  }
+}
+
+// Whether a hostname is the workspace website's, with or without `www.`
+const isWebsiteHost = (hostname: string, website: URL | null): boolean => {
+  if (!website) return false
+  const host = website.hostname
+  return hostname === host || hostname === `www.${host}` || `www.${hostname}` === host
+}
 
 interface ContactTimelineProps {
   entries: ContactTimelineEntry[]
@@ -95,19 +136,15 @@ export function ContactTimeline({
       updated: 'blue',
       sent: 'blue',
       'status changed': 'blue',
-      'auth email': 'blue',
       // Warning actions
       left: 'orange',
       pending: 'orange',
       // Negative actions
       deleted: 'red',
       removed: 'red',
-      bounce: 'volcano',
-      complaint: 'magenta',
       // Engagement actions
       opened: 'cyan',
       clicked: 'geekblue',
-      'user created': 'cyan',
       // Automation actions
       started: 'blue',
       ended: 'green',
@@ -150,6 +187,8 @@ export function ContactTimeline({
           return faCircleExclamation
         } else if (eventType === 'complaint') {
           return faTriangleExclamation
+        } else if (eventType === 'unsubscribe') {
+          return faBan
         } else if (eventType === 'delivered') {
           return faCheck
         } else if (eventType === 'reply') {
@@ -205,16 +244,38 @@ export function ContactTimeline({
   // the domain was recorded. It is only a fallback: a workspace can track a site
   // that is not the one configured in its settings, and guessing wrong there
   // sends someone to a page that was never visited.
+  //
+  // For the same reason the address must stay on that site. A path is appended to
+  // the site's origin rather than resolved against it, so `//x/y` is a page of the
+  // site as it is for the browser that reported it; anything else the SDK may have
+  // been given, a full URL included, is resolved and kept only if it lands there.
+  //
+  // The domain is reported by the visitor's browser too, so it is trusted only
+  // as far as the workspace vouches for it: one of its web analytics allowed
+  // domains, the only ones a workspace that lists any receives visits from, or,
+  // with none listed, the host of its website, `www.` or not. A domain taken off the list takes
+  // the previews of its earlier visits with it.
   const webPageURL = (entry: ContactTimelineEntry): string | null => {
     const path = webChange<string>(entry, 'path')
     if (!path) return null
 
-    const domain = webChange<string>(entry, 'landing_domain')
-    const origin = domain ? `https://${domain}` : workspace?.settings?.website_url
+    // An IPv6 address is recorded without the brackets a URL needs
+    const domain = webChange<string>(entry, 'landing_domain')?.replace(/^([^[].*:.*)$/, '[$1]')
+    const website = parseWebsiteURL(workspace?.settings?.website_url)
+    const origin = domain ? `https://${domain}` : website?.href
     if (!origin) return null
 
     try {
-      return new URL(path, origin).toString()
+      const site = new URL(origin)
+      const trackedDomains = workspace?.settings?.web_analytics?.allowed_domains ?? []
+      const vouched =
+        trackedDomains.length > 0
+          ? isTrackedHost(site.hostname, trackedDomains)
+          : isWebsiteHost(site.hostname, website)
+      if (domain && !vouched) return null
+      const page = path.startsWith('/') ? new URL(site.origin + path) : new URL(path, site)
+      if (page.origin !== site.origin) return null
+      return safeExternalUrl(page.toString())
     } catch {
       return null
     }
@@ -647,24 +708,27 @@ export function ContactTimeline({
 
         const isSupabase = source === 'supabase'
 
-        // Map event types to labels and colors
-        const webhookEventLabels: Record<string, string> = {
-          delivered: t`Delivered`,
-          bounce: t`Bounce`,
-          complaint: t`Complaint`,
-          reply: t`Replied`,
-          auto_reply: t`Auto-reply`,
-          auth_email: t`Auth Email`,
-          before_user_created: t`User Created`
+        // Map event types to labels and colors. The color is keyed on the type, not read
+        // from the label, which is translated.
+        const webhookEventTags: Record<string, { label: string; color?: string }> = {
+          delivered: { label: t`Delivered`, color: 'green' },
+          bounce: { label: t`Bounce`, color: 'volcano' },
+          complaint: { label: t`Complaint`, color: 'magenta' },
+          unsubscribe: { label: t`Unsubscribed`, color: 'red' },
+          reply: { label: t`Replied` },
+          auto_reply: { label: t`Auto-reply` },
+          auth_email: { label: t`Auth Email`, color: 'blue' },
+          before_user_created: { label: t`User Created`, color: 'cyan' }
         }
-        const webhookActionLabel = webhookEventLabels[eventType || ''] || eventType || t`Event`
+        const webhookEventTag = webhookEventTags[eventType || '']
+        const webhookActionLabel = webhookEventTag?.label || eventType || t`Event`
 
         // Provider icon as prefix content
         const providerPrefix = source ? getProviderIcon(source, 'small') : undefined
 
         return (
           <div>
-            {renderEventHeader(entry, t`Webhook`, webhookActionLabel, undefined, providerPrefix)}
+            {renderEventHeader(entry, t`Webhook`, webhookActionLabel, webhookEventTag?.color || 'default', providerPrefix)}
             <div className="space-y-1">
               {isSupabase && (
                 <div className="text-sm">

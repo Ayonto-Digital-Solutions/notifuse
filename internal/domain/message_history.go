@@ -173,7 +173,8 @@ type MessageHistoryRepository interface {
 	// ListMessages retrieves message history with cursor-based pagination and filtering
 	ListMessages(ctx context.Context, workspaceID string, secretKey string, params MessageListParams) ([]*MessageHistory, string, error)
 
-	// SetStatusesIfNotSet updates multiple message statuses in a batch if they haven't been set before
+	// SetStatusesIfNotSet updates multiple message statuses in a batch if they haven't been set before.
+	// An unsubscribe is not recorded on a message whose address an erasure redacted.
 	SetStatusesIfNotSet(ctx context.Context, workspaceID string, updates []MessageEventUpdate) error
 
 	// SetClicked sets the clicked_at timestamp and ensures opened_at is also set.
@@ -194,6 +195,23 @@ type MessageHistoryRepository interface {
 	// When templateID is non-empty, only clicks on messages sent with that template
 	// (i.e. that A/B variation) are counted; empty templateID covers the whole broadcast.
 	GetBroadcastLinkStats(ctx context.Context, workspaceID, broadcastID, templateID string) ([]LinkClickStats, error)
+
+	// WasSentForList reports whether message messageID was sent to email for listID: by
+	// the list stored on the message, or, for an older automation message stored without
+	// one, by the automation's current list
+	WasSentForList(ctx context.Context, workspaceID, messageID, email, listID string) (bool, error)
+
+	// GetRecipientAndList returns who message id was sent to and the list it was sent for,
+	// read as WasSentForList reads it, so the automation's current list for an older
+	// automation message stored without one (nil for a transactional email). Only id,
+	// contact_email and list_id are populated. Returns (nil, nil) when there is no such
+	// message.
+	GetRecipientAndList(ctx context.Context, workspaceID, id string) (*MessageHistory, error)
+
+	// GetRecipients returns, for each of ids that names a message, the address it was sent
+	// to. Ids that name no message are absent from the map, as are the messages whose
+	// address an erasure redacted: they name no one.
+	GetRecipients(ctx context.Context, workspaceID string, ids []string) (map[string]string, error)
 
 	// DeleteForEmail deletes all message history records for a specific email
 	DeleteForEmail(ctx context.Context, workspaceID, email string) error

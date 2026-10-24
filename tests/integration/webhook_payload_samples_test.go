@@ -95,6 +95,10 @@ func TestWebhookPayloadSamples(t *testing.T) {
 	defer testutil.CleanupTestEnvironment()
 
 	suite := testutil.NewIntegrationTestSuite(t, func(cfg *config.Config) testutil.AppInterface {
+		// Allow loopback test servers: this suite exercises webhook delivery against
+		// httptest servers, which bind to 127.0.0.1. Production refuses those by
+		// default; see TestWebhookDeliverySSRFProtection for the secure default.
+		cfg.Webhook.AllowPrivateDeliveryHosts = true
 		return app.NewApp(cfg)
 	})
 	defer suite.Cleanup()
@@ -267,9 +271,9 @@ func seedZapierSampleEvents(t *testing.T, db *sql.DB) {
 		VALUES ($1, $2, 'active', $3::timestamptz, $3::timestamptz)`,
 		zapierSampleEmail, zapierSampleListID, zapierSampleInstant)
 
-	// active -> pending matches none of the trigger's transitions and emits
-	// nothing; it exists only to set up the pending -> active move below, which is
-	// the single transition that produces list.confirmed.
+	// active -> pending emits list.pending, which no v1 trigger subscribes to, so
+	// it queues nothing here; it exists only to set up the pending -> active move
+	// below, which is the single transition that produces list.confirmed.
 	setListStatus("pending")
 	setListStatus("active")
 

@@ -139,6 +139,36 @@ func (mr *MockMessageHistoryRepositoryMockRecorder) GetBySMTPMessageID(arg0, arg
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBySMTPMessageID", reflect.TypeOf((*MockMessageHistoryRepository)(nil).GetBySMTPMessageID), arg0, arg1, arg2)
 }
 
+// GetRecipientAndList mocks base method.
+func (m *MockMessageHistoryRepository) GetRecipientAndList(arg0 context.Context, arg1, arg2 string) (*domain.MessageHistory, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetRecipientAndList", arg0, arg1, arg2)
+	ret0, _ := ret[0].(*domain.MessageHistory)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetRecipientAndList indicates an expected call of GetRecipientAndList.
+func (mr *MockMessageHistoryRepositoryMockRecorder) GetRecipientAndList(arg0, arg1, arg2 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetRecipientAndList", reflect.TypeOf((*MockMessageHistoryRepository)(nil).GetRecipientAndList), arg0, arg1, arg2)
+}
+
+// GetRecipients mocks base method.
+func (m *MockMessageHistoryRepository) GetRecipients(arg0 context.Context, arg1 string, arg2 []string) (map[string]string, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetRecipients", arg0, arg1, arg2)
+	ret0, _ := ret[0].(map[string]string)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetRecipients indicates an expected call of GetRecipients.
+func (mr *MockMessageHistoryRepositoryMockRecorder) GetRecipients(arg0, arg1, arg2 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetRecipients", reflect.TypeOf((*MockMessageHistoryRepository)(nil).GetRecipients), arg0, arg1, arg2)
+}
+
 // ListMessages mocks base method.
 func (m *MockMessageHistoryRepository) ListMessages(arg0 context.Context, arg1, arg2 string, arg3 domain.MessageListParams) ([]*domain.MessageHistory, string, error) {
 	m.ctrl.T.Helper()
@@ -209,4 +239,19 @@ func (m *MockMessageHistoryRepository) Upsert(arg0 context.Context, arg1, arg2 s
 func (mr *MockMessageHistoryRepositoryMockRecorder) Upsert(arg0, arg1, arg2, arg3 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Upsert", reflect.TypeOf((*MockMessageHistoryRepository)(nil).Upsert), arg0, arg1, arg2, arg3)
+}
+
+// WasSentForList mocks base method.
+func (m *MockMessageHistoryRepository) WasSentForList(arg0 context.Context, arg1, arg2, arg3, arg4 string) (bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "WasSentForList", arg0, arg1, arg2, arg3, arg4)
+	ret0, _ := ret[0].(bool)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// WasSentForList indicates an expected call of WasSentForList.
+func (mr *MockMessageHistoryRepositoryMockRecorder) WasSentForList(arg0, arg1, arg2, arg3, arg4 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "WasSentForList", reflect.TypeOf((*MockMessageHistoryRepository)(nil).WasSentForList), arg0, arg1, arg2, arg3, arg4)
 }
