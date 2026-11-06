@@ -22,43 +22,23 @@ import { useLingui } from '@lingui/react/macro'
 import { WorkspaceMember, UserPermissions, StoredPermissions } from '../../services/api/types'
 import { workspaceService } from '../../services/api/workspace'
 import {
-  ALL_PERMISSION_RESOURCES,
+  ENFORCED_PERMISSION_VERBS,
+  OPT_IN_PERMISSION_RESOURCES,
+  countEnforcedGrants,
   createEmptyPermissions,
+  grantUnenforcedPermissions,
   createFullPermissions,
-  grantUnenforcedPermissions
+  grantsFullPermissions
 } from '../../services/api/permissions'
 import { ApiError } from '../../services/api/client'
 import { EditPermissionsDrawer } from './EditPermissionsDrawer'
 import { PermissionsMatrix } from './PermissionsMatrix'
+import { PermissionScopePresets } from './PermissionScopePresets'
 import { useLicense } from '../../hooks/useLicense'
 import { LicenceGateNotice } from '../license/LicenceGateNotice'
 import { SettingsSectionHeader } from './SettingsSectionHeader'
 
 const { Text } = Typography
-
-// Narrowly scoped keys are the common case for an integration — the Zapier onboarding asks for
-// three resources out of the canonical list — and reaching one from the full-access default meant
-// flipping every other switch by hand. These two set the floor the owner then edits.
-function PermissionScopePresets({ onChange }: { onChange: (value: UserPermissions) => void }) {
-  const { t } = useLingui()
-
-  return (
-    <div className="flex justify-end gap-1 mb-2">
-      <Button size="small" type="link" onClick={() => onChange(createFullPermissions())}>
-        {t`Grant all`}
-      </Button>
-      {/* Revoking still hands back the unenforceable verbs granted: a stored `false` there would
-          never be widened by a backfill, which only ever adds the keys a row is missing. */}
-      <Button
-        size="small"
-        type="link"
-        onClick={() => onChange(grantUnenforcedPermissions(createEmptyPermissions()))}
-      >
-        {t`Revoke all`}
-      </Button>
-    </div>
-  )
-}
 
 interface WorkspaceMembersProps {
   workspaceId: string
@@ -82,6 +62,10 @@ export function WorkspaceMembers({
   const [invitePermissions, setInvitePermissions] =
     useState<UserPermissions>(createFullPermissions)
   const { has } = useLicense()
+  // Without the rbac licence the server accepts full access and refuses anything narrower, on
+  // invitations and API keys alike: the choices that would narrow a set are greyed, and the
+  // submit button waits until the set is full access. Advisory: the 402 stays the real gate.
+  const rbacLocked = !has('rbac')
   const { message } = App.useApp()
 
   // API Key drawer states
@@ -143,36 +127,48 @@ export function WorkspaceMembers({
         // may be partial or null — a resource it does not mention is denied.
         const permissions: StoredPermissions = record.permissions ?? createEmptyPermissions()
 
-        // The denominator is the whole resource list, not the row's key count: a row holding
-        // three resources is not Full Access.
-        const totalPermissions = ALL_PERMISSION_RESOURCES.length * 2 // read + write for each resource
-        const activePermissions = Object.values(permissions).reduce(
-          (count, perm) => count + (perm?.read ? 1 : 0) + (perm?.write ? 1 : 0),
-          0
-        )
+        // Full Access is the server's definition, read the way the editor reads a row: the
+        // unenforced verbs count as granted, as the editor shows and saves them, so a row stored
+        // with one of them off is still full access. It is checked first and never inferred from
+        // the count. The count is over the verbs that gate something, canonical and opt-in alike:
+        // the console stores the unenforced verbs as granted on every save, and counting them put
+        // a full row above the total, made a row one verb short read as full, and kept a revoked
+        // row from ever reading No Access.
+        const totalPermissions = ENFORCED_PERMISSION_VERBS.length
+        const activePermissions = countEnforcedGrants(permissions)
+        const details = <PermissionsMatrix value={permissions} />
+
+        if (
+          grantsFullPermissions(
+            grantUnenforcedPermissions({ ...createEmptyPermissions(), ...permissions })
+          )
+        ) {
+          const tag = <Tag color="green">{t`Full Access`}</Tag>
+          // An opt-in grant on top of full access (Audit logs read) is not implied by it, so it
+          // stays one hover away rather than hidden behind the same tag as a plain full grant.
+          const holdsOptIn = ENFORCED_PERMISSION_VERBS.some(
+            ([resource, verb]) =>
+              OPT_IN_PERMISSION_RESOURCES.includes(resource) && permissions[resource]?.[verb]
+          )
+          if (!holdsOptIn) return tag
+          return (
+            <Popover content={details} title={t`Permission Details`} trigger="hover">
+              <span className="cursor-pointer">{tag}</span>
+            </Popover>
+          )
+        }
 
         if (activePermissions === 0) {
           return (
-            <Popover
-              content={<PermissionsMatrix value={permissions} />}
-              title={t`Permission Details`}
-              trigger="hover"
-            >
+            <Popover content={details} title={t`Permission Details`} trigger="hover">
               <Tag color="red" className="cursor-pointer">
                 {t`No Access`}
               </Tag>
             </Popover>
           )
         }
-        if (activePermissions === totalPermissions) {
-          return <Tag color="green">{t`Full Access`}</Tag>
-        }
         return (
-          <Popover
-            content={<PermissionsMatrix value={permissions} />}
-            title={t`Permission Details`}
-            trigger="hover"
-          >
+          <Popover content={details} title={t`Permission Details`} trigger="hover">
             <Tag color="blue" className="cursor-pointer">
               {activePermissions}/{totalPermissions}
             </Tag>
@@ -481,7 +477,12 @@ export function WorkspaceMembers({
           <div className="flex justify-end">
             <Space>
               <Button onClick={() => setInviteDrawerOpen(false)}>{t`Cancel`}</Button>
-              <Button type="primary" onClick={handleInvite} loading={inviting}>
+              <Button
+                type="primary"
+                onClick={handleInvite}
+                loading={inviting}
+                disabled={rbacLocked && !grantsFullPermissions(invitePermissions)}
+              >
                 {t`Send Invitation`}
               </Button>
             </Space>
@@ -502,14 +503,18 @@ export function WorkspaceMembers({
           </Form.Item>
 
           <Form.Item label={t`Permissions`}>
-            {/* An invite starts from a full grant, which is never gated, so a locked matrix
-                still holds a legal invitation; only narrowing it needs the licence. */}
+            {/* An invite starts from a full grant, which is never gated, so it can be sent as it
+                is without the licence; only narrowing it needs one. */}
             <LicenceGateNotice feature="rbac" workspaceId={workspaceId} />
-            <PermissionScopePresets onChange={setInvitePermissions} />
+            <PermissionScopePresets
+              value={invitePermissions}
+              onChange={setInvitePermissions}
+              fullAccessOnly={rbacLocked}
+            />
             <PermissionsMatrix
               value={invitePermissions}
               onChange={setInvitePermissions}
-              disabled={!has('rbac')}
+              fullAccessOnly={rbacLocked}
             />
           </Form.Item>
         </Form>
@@ -534,7 +539,12 @@ export function WorkspaceMembers({
             ) : (
               <Space>
                 <Button onClick={resetApiKeyDrawer}>{t`Cancel`}</Button>
-                <Button type="primary" onClick={handleCreateApiKey} loading={creatingApiKey}>
+                <Button
+                  type="primary"
+                  onClick={handleCreateApiKey}
+                  loading={creatingApiKey}
+                  disabled={rbacLocked && !grantsFullPermissions(apiKeyPermissions)}
+                >
                   {t`Create API Key`}
                 </Button>
               </Space>
@@ -570,8 +580,19 @@ export function WorkspaceMembers({
             </Form.Item>
 
             <Form.Item label={t`Permissions`}>
-              <PermissionScopePresets onChange={setApiKeyPermissions} />
-              <PermissionsMatrix value={apiKeyPermissions} onChange={setApiKeyPermissions} />
+              {/* Same rule as the invitation: a key starts from full access, which is never
+                  gated; scoping it down needs the licence. */}
+              <LicenceGateNotice feature="rbac" workspaceId={workspaceId} />
+              <PermissionScopePresets
+                value={apiKeyPermissions}
+                onChange={setApiKeyPermissions}
+                fullAccessOnly={rbacLocked}
+              />
+              <PermissionsMatrix
+                value={apiKeyPermissions}
+                onChange={setApiKeyPermissions}
+                fullAccessOnly={rbacLocked}
+              />
             </Form.Item>
           </Form>
         ) : (

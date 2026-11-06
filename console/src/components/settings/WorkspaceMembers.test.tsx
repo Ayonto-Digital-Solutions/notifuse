@@ -10,6 +10,10 @@ import type { PermissionResource, WorkspaceMember } from '../../services/api/typ
 import {
   ALL_PERMISSION_RESOURCES,
   OPT_IN_PERMISSION_RESOURCES,
+  ENFORCED_PERMISSION_VERBS,
+  createEmptyPermissions,
+  createFullPermissions,
+  grantUnenforcedPermissions,
   isPermissionEnforced
 } from '../../services/api/permissions'
 
@@ -131,7 +135,7 @@ describe('WorkspaceMembers permissions column', () => {
     renderMembers([member])
 
     const row = rowFor(member)
-    expect(row.textContent).toContain(`1/${ALL_PERMISSION_RESOURCES.length * 2}`)
+    expect(row.textContent).toContain(`1/${ENFORCED_PERMISSION_VERBS.length}`)
     expect(row.textContent).not.toContain('Full Access')
   })
 
@@ -145,8 +149,10 @@ describe('WorkspaceMembers permissions column', () => {
     expect(rowFor(member).textContent).toContain('Full Access')
   })
 
-  it('uses the whole resource list as the badge denominator, not the row key count', () => {
-    expect(ALL_PERMISSION_RESOURCES).toHaveLength(14)
+  it('uses every enforced verb as the badge denominator, not the row key count', () => {
+    // Pinned here and in permissions.test.ts: fourteen canonical resources and Audit logs read,
+    // less the three canonical verbs no endpoint enforces.
+    expect(ENFORCED_PERMISSION_VERBS).toHaveLength(26)
 
     // A row that grants read+write on three resources is not Full Access.
     const member = apiKeyRow({
@@ -157,8 +163,75 @@ describe('WorkspaceMembers permissions column', () => {
     renderMembers([member])
 
     const row = rowFor(member)
-    expect(row.textContent).toContain('6/28')
+    expect(row.textContent).toContain('6/26')
     expect(row.textContent).not.toContain('Full Access')
+  })
+
+  // The shapes the console itself saves: every set leaves the drawer through
+  // grantUnenforcedPermissions, so it carries the unenforced verbs, Audit logs write included.
+  const savedFull = () => grantUnenforcedPermissions(createFullPermissions())
+  // A row with details to show wraps its tag in a Popover; one without renders the tag alone. The
+  // wrapper is what antd attaches the hover to, so its presence is the assertion — read
+  // synchronously, so a missing popover costs no timeout and a render failure is not swallowed.
+  const hasPopover = (member: WorkspaceMember) =>
+    rowFor(member).querySelector('.cursor-pointer') !== null
+
+  it('shows Full Access for a full set as the editor saves it', () => {
+    const member = apiKeyRow(savedFull())
+    renderMembers([member])
+
+    expect(rowFor(member).textContent).toContain('Full Access')
+    expect(hasPopover(member)).toBe(false)
+  })
+
+  it('shows Full Access for a full set that can also read audit logs, and keeps that grant visible', async () => {
+    const member = apiKeyRow({ ...savedFull(), audit_logs: { read: true, write: true } })
+    renderMembers([member])
+
+    expect(rowFor(member).textContent).toContain('Full Access')
+    expect(hasPopover(member)).toBe(true)
+
+    // And the hover really opens it, so the audit grant is reachable from the list.
+    fireEvent.mouseEnter(rowFor(member).querySelector('.cursor-pointer') as HTMLElement)
+    expect(await screen.findByText('Permission Details')).toBeInTheDocument()
+  })
+
+  it('does not call a set one verb short of full Full Access', () => {
+    const permissions = savedFull()
+    permissions.contacts = { read: true, write: false }
+    const member = apiKeyRow(permissions)
+    renderMembers([member])
+
+    const total = ENFORCED_PERMISSION_VERBS.length
+    const canonical = ENFORCED_PERMISSION_VERBS.filter(([resource]) =>
+      ALL_PERMISSION_RESOURCES.includes(resource)
+    ).length
+    expect(rowFor(member).textContent).not.toContain('Full Access')
+    expect(rowFor(member).textContent).toContain(`${canonical - 1}/${total}`)
+  })
+
+  // Older consoles and API callers could store an unenforced verb as false. It gates nothing, the
+  // editor shows it granted and saves it so, so the row is full access.
+  it('shows Full Access for a full set stored with an unenforced verb off', () => {
+    const member = apiKeyRow({ ...createFullPermissions(), llm: { read: false, write: true } })
+    renderMembers([member])
+
+    expect(rowFor(member).textContent).toContain('Full Access')
+  })
+
+  it('shows No Access for the set Revoke all saves', () => {
+    const member = apiKeyRow(grantUnenforcedPermissions(createEmptyPermissions()))
+    renderMembers([member])
+
+    expect(rowFor(member).textContent).toContain('No Access')
+  })
+
+  it('counts a key that can only read audit logs instead of calling it No Access', () => {
+    const member = apiKeyRow({ audit_logs: { read: true, write: true } })
+    renderMembers([member])
+
+    expect(rowFor(member).textContent).not.toContain('No Access')
+    expect(rowFor(member).textContent).toContain(`1/${ENFORCED_PERMISSION_VERBS.length}`)
   })
 
   it('renders a row whose permissions are undefined without throwing', () => {
@@ -366,6 +439,45 @@ describe('create API key drawer', () => {
     }
   })
 
+  // The same rule as the invitation: a full key is never gated, a scoped one is. The matrix used
+  // to stay fully live without the licence, so the refusal only came as a 402 on Create.
+  it('greys every choice that narrows the key under an unlicensed deployment, and creates a full key', async () => {
+    renderMembers([], ['template_i18n'])
+    fireEvent.click(screen.getByRole('button', { name: 'Create API Key' }))
+    const drawer = await openDrawer('Create API Key')
+
+    expect(
+      within(drawer).getByText('Custom permissions require a Notifuse Studio licence.')
+    ).toBeInTheDocument()
+    for (const resource of ALL_PERMISSION_RESOURCES) {
+      const { read, write } = switchesFor(drawer, resource)
+      expect(read.disabled).toBe(true)
+      expect(write.disabled).toBe(true)
+    }
+    expect(within(drawer).getByRole('button', { name: 'Revoke all' })).toBeDisabled()
+
+    fireEvent.change(within(drawer).getByRole('textbox'), { target: { value: 'sender' } })
+    const create = within(footerOf(drawer)).getByRole('button', { name: 'Create API Key' })
+    expect(create).toBeEnabled()
+    fireEvent.click(create)
+
+    await waitFor(() => expect(api.createAPIKey).toHaveBeenCalled())
+    const { permissions } = api.createAPIKey.mock.calls[0][0]
+    for (const resource of ALL_PERMISSION_RESOURCES) {
+      expect(permissions[resource]).toEqual({ read: true, write: true })
+    }
+  })
+
+  it('leaves the key matrix live when the licence covers custom permissions', async () => {
+    renderMembers([], ['rbac'])
+    fireEvent.click(screen.getByRole('button', { name: 'Create API Key' }))
+    const drawer = await openDrawer('Create API Key')
+
+    expect(within(drawer).queryByText(/requires? a Notifuse/i)).not.toBeInTheDocument()
+    expect(switchesFor(drawer, 'contacts').write.disabled).toBe(false)
+    expect(within(drawer).getByRole('button', { name: 'Revoke all' })).toBeEnabled()
+  })
+
   it('advertises the address the server actually mints, without a workspace id in it', async () => {
     const drawer = await openCreateApiKey()
 
@@ -399,18 +511,23 @@ describe('invite member drawer', () => {
     return openDrawer('Invite Member')
   }
 
-  // An invite starts from a full grant, which the server never gates, so a locked matrix still
-  // holds a legal invitation. What is locked is narrowing it — the licensed capability — and
-  // it is said here, before Send, rather than as a 402 after it.
-  it('locks the matrix under an unlicensed deployment, and says what to buy', async () => {
+  // An invite starts from a full grant, which the server never gates, so it can be sent as it
+  // is. What is locked is narrowing it — the licensed capability — and it is said here, before
+  // Send, rather than as a 402 after it.
+  it('greys every choice that narrows the grant under an unlicensed deployment, and says what to buy', async () => {
     const drawer = await openInvite(['template_i18n'])
 
     expect(
       within(drawer).getByText('Custom permissions require a Notifuse Studio licence.')
     ).toBeInTheDocument()
-    const switches = within(drawer).getAllByRole('switch')
-    expect(switches.length).toBeGreaterThan(0)
-    expect(switches.every((s) => (s as HTMLButtonElement).disabled)).toBe(true)
+    for (const resource of ALL_PERMISSION_RESOURCES) {
+      const { read, write } = switchesFor(drawer, resource)
+      expect(read.disabled).toBe(true)
+      expect(write.disabled).toBe(true)
+    }
+    expect(within(drawer).getByRole('button', { name: 'Revoke all' })).toBeDisabled()
+    expect(within(drawer).getByRole('button', { name: 'Grant all' })).toBeEnabled()
+    expect(within(footerOf(drawer)).getByRole('button', { name: 'Send Invitation' })).toBeEnabled()
   })
 
   it('sends a grant naming every canonical resource', async () => {

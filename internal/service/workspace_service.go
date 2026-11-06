@@ -187,6 +187,10 @@ func (s *WorkspaceService) GetWorkspace(ctx context.Context, id string) (*domain
 	return workspace, nil
 }
 
+// workspaceSetupTimeout bounds what follows the creation of a workspace, detached from
+// the request: the owner membership, contact, list and tasks.
+const workspaceSetupTimeout = 5 * time.Minute
+
 // CreateWorkspace creates a new workspace and adds the creator as owner
 func (s *WorkspaceService) CreateWorkspace(ctx context.Context, id string, name string, websiteURL string, logoURL string, coverURL string, timezone string, fileManager domain.FileManagerSettings, defaultLanguage string, languages []string) (*domain.Workspace, error) {
 	user, err := s.authService.AuthenticateUserFromContext(ctx)
@@ -291,13 +295,20 @@ func (s *WorkspaceService) CreateWorkspace(ctx context.Context, id string, name 
 	// check if workspace already exists
 	if existingWorkspace, _ := s.repo.GetByID(ctx, id); existingWorkspace != nil {
 		s.logger.WithField("workspace_id", id).Error("Workspace already exists")
-		return nil, fmt.Errorf("workspace already exists")
+		return nil, domain.ErrWorkspaceAlreadyExists
 	}
 
-	if err := s.repo.Create(ctx, workspace); err != nil {
+	// From here on, detached from the request: a client disconnecting mid-way must not
+	// leave a registered workspace without its owner membership, contact or list.
+	// Values (the audit entry among them) are kept. The repository bounds the creation
+	// itself; what follows gets its own bound once the workspace exists.
+	detached := context.WithoutCancel(ctx)
+	if err := s.repo.Create(detached, workspace); err != nil {
 		s.logger.WithField("workspace_id", id).WithField("error", err.Error()).Error("Failed to create workspace")
 		return nil, err
 	}
+	ctx, cancel := context.WithTimeout(detached, workspaceSetupTimeout)
+	defer cancel()
 
 	// Add the creator as owner
 	userWorkspace := &domain.UserWorkspace{
@@ -997,11 +1008,16 @@ func (s *WorkspaceService) SetUserPermissions(ctx context.Context, workspaceID, 
 		return err
 	}
 
-	// The canonical permission editor, and the one write path whose entire purpose is a
-	// granular grant — so it is refused outright without the licence rather than tested
-	// against FullPermissions. Membership rows already carrying restricted permissions keep
-	// them and keep having them enforced: this gates the editor, never HasPermission.
-	if !s.isLicensedFor(domain.FeatureRBAC) {
+	// Granular permissions are licensed; full access is not. The same rule as InviteMember and
+	// CreateAPIKey: without the licence an owner may still put a member or an API key on full
+	// access — including one holding a restricted set from when a key covered rbac — and only a
+	// narrower set is refused. Rows already carrying restricted permissions keep them and keep
+	// having them enforced: this gates the editor, never HasPermission.
+	//
+	// After the owner check and Validate on purpose, so a caller who may not edit permissions,
+	// or who sent a malformed map, never learns the licence state through a 402. An empty map
+	// is not full here — stored, it denies every verb — unlike CreateAPIKey's nil.
+	if !grantsFullPermissions(permissions) && !s.isLicensedFor(domain.FeatureRBAC) {
 		return domain.NewFeatureNotLicensedError(domain.FeatureRBAC)
 	}
 
