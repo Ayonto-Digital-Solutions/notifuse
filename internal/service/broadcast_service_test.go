@@ -497,8 +497,8 @@ func TestBroadcastService_GetTestResults_ComputesRecommendation(t *testing.T) {
 	d.repo.EXPECT().GetBroadcast(ctx, workspaceID, broadcastID).Return(b, nil)
 
 	// stats for A and B
-	d.messageHistoryRepo.EXPECT().GetBroadcastVariationStats(ctx, workspaceID, broadcastID, "tplA").Return(&domain.MessageHistoryStatusSum{TotalSent: 100, TotalDelivered: 100, TotalOpened: 30, TotalClicked: 5}, nil)
-	d.messageHistoryRepo.EXPECT().GetBroadcastVariationStats(ctx, workspaceID, broadcastID, "tplB").Return(&domain.MessageHistoryStatusSum{TotalSent: 100, TotalDelivered: 100, TotalOpened: 25, TotalClicked: 10}, nil)
+	d.messageHistoryRepo.EXPECT().GetBroadcastVariationStats(ctx, workspaceID, broadcastID, "tplA").Return(&domain.MessageHistoryStatusSum{TotalSent: 100, TotalDelivered: 100, TotalOpensTracked: 100, TotalClicksTracked: 100, TotalOpened: 30, TotalClicked: 5}, nil)
+	d.messageHistoryRepo.EXPECT().GetBroadcastVariationStats(ctx, workspaceID, broadcastID, "tplB").Return(&domain.MessageHistoryStatusSum{TotalSent: 100, TotalDelivered: 100, TotalOpensTracked: 100, TotalClicksTracked: 100, TotalOpened: 25, TotalClicked: 10}, nil)
 
 	res, err := d.svc.GetTestResults(ctx, workspaceID, broadcastID)
 	require.NoError(t, err)
@@ -518,9 +518,14 @@ func TestBroadcastService_SelectWinner_SetsWinnerAndResumesTask(t *testing.T) {
 	winner := "tplA"
 	authOK(d.authService, ctx, workspaceID)
 
-	// transaction wrapper
+	// transaction wrapper; committed turns true once it has returned
+	committed := false
 	d.repo.EXPECT().WithTransaction(ctx, workspaceID, gomock.Any()).DoAndReturn(
-		func(_ context.Context, _ string, fn func(*sql.Tx) error) error { return fn(nil) },
+		func(_ context.Context, _ string, fn func(*sql.Tx) error) error {
+			err := fn(nil)
+			committed = err == nil
+			return err
+		},
 	)
 
 	b := testBroadcast(workspaceID, broadcastID)
@@ -529,14 +534,24 @@ func TestBroadcastService_SelectWinner_SetsWinnerAndResumesTask(t *testing.T) {
 	b.TestSettings.AutoSendWinner = false
 	b.TestSettings.Variations = []domain.BroadcastVariation{{VariationName: "A", TemplateID: winner}, {VariationName: "B", TemplateID: "tplB"}}
 
-	d.repo.EXPECT().GetBroadcastTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
+	d.repo.EXPECT().GetBroadcastForUpdateTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
 	d.repo.EXPECT().UpdateBroadcastTx(ctx, gomock.Any(), gomock.Any()).Return(nil)
 
-	// Task repo: wake the task if present. Never Update: writing back the task it
-	// read would hand a running task to a second execution.
+	// Task repo: wake the task if present, once the winner is committed, so the
+	// broadcast row is not held during calls to the system database. Never
+	// Update: writing back the task it read would hand a running task to a
+	// second execution.
 	task := &domain.Task{ID: "task1", WorkspaceID: workspaceID, Status: domain.TaskStatusPaused}
-	d.taskRepo.EXPECT().GetTaskByBroadcastID(ctx, workspaceID, broadcastID).Return(task, nil)
-	d.taskRepo.EXPECT().WakeTask(ctx, workspaceID, task.ID, gomock.Any()).Return(true, nil)
+	d.taskRepo.EXPECT().GetTaskByBroadcastID(ctx, workspaceID, broadcastID).DoAndReturn(
+		func(context.Context, string, string) (*domain.Task, error) {
+			assert.True(t, committed, "the task is looked up after the winner is committed")
+			return task, nil
+		})
+	d.taskRepo.EXPECT().WakeTask(ctx, workspaceID, task.ID, gomock.Any()).DoAndReturn(
+		func(context.Context, string, string, time.Time) (bool, error) {
+			assert.True(t, committed, "the task is woken after the winner is committed")
+			return true, nil
+		})
 
 	// A woken task is run straight away when auto-execution is on.
 	executed := make(chan struct{})
@@ -578,7 +593,7 @@ func TestBroadcastService_SelectWinner_LeavesAHeldTaskToItsRun(t *testing.T) {
 	b.TestSettings.AutoSendWinner = false
 	b.TestSettings.Variations = []domain.BroadcastVariation{{VariationName: "A", TemplateID: winner}, {VariationName: "B", TemplateID: "tplB"}}
 
-	d.repo.EXPECT().GetBroadcastTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
+	d.repo.EXPECT().GetBroadcastForUpdateTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
 	d.repo.EXPECT().UpdateBroadcastTx(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
 		func(_ context.Context, _ *sql.Tx, saved *domain.Broadcast) error {
 			require.NotNil(t, saved.WinningTemplate)
@@ -619,7 +634,7 @@ func TestBroadcastService_SelectWinner_TaskGoneBeforeWake(t *testing.T) {
 			b := testBroadcast(workspaceID, broadcastID)
 			b.Status = domain.BroadcastStatusTestCompleted
 			b.TestSettings.Variations = []domain.BroadcastVariation{{VariationName: "A", TemplateID: templateID}}
-			d.repo.EXPECT().GetBroadcastTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
+			d.repo.EXPECT().GetBroadcastForUpdateTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
 			d.repo.EXPECT().UpdateBroadcastTx(ctx, gomock.Any(), gomock.Any()).Return(nil)
 
 			task := &domain.Task{ID: "task1", WorkspaceID: workspaceID, Status: domain.TaskStatusPending}
@@ -632,6 +647,97 @@ func TestBroadcastService_SelectWinner_TaskGoneBeforeWake(t *testing.T) {
 
 	err := d.svc.SelectWinner(ctx, workspaceID, broadcastID, templateID)
 	require.NoError(t, err)
+}
+
+// A wake that fails after the winner is saved returns its error and leaves the
+// winner saved (the next test covers the owner repeating that pick).
+func TestBroadcastService_SelectWinner_WakeErrorKeepsTheSavedWinner(t *testing.T) {
+	d := setupBroadcastSvc(t)
+	defer d.ctrl.Finish()
+
+	ctx := context.Background()
+	workspaceID := "w1"
+	broadcastID := "b1"
+	templateID := "tplA"
+	authOK(d.authService, ctx, workspaceID)
+
+	d.repo.EXPECT().WithTransaction(ctx, workspaceID, gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ string, fn func(*sql.Tx) error) error { return fn(nil) },
+	)
+	b := testBroadcast(workspaceID, broadcastID)
+	b.Status = domain.BroadcastStatusTestCompleted
+	b.TestSettings.Variations = []domain.BroadcastVariation{{VariationName: "A", TemplateID: templateID}}
+	d.repo.EXPECT().GetBroadcastForUpdateTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
+	d.repo.EXPECT().UpdateBroadcastTx(ctx, gomock.Any(), gomock.Any()).Return(nil)
+
+	task := &domain.Task{ID: "task1", WorkspaceID: workspaceID, Status: domain.TaskStatusPaused}
+	d.taskRepo.EXPECT().GetTaskByBroadcastID(ctx, workspaceID, broadcastID).Return(task, nil)
+	d.taskRepo.EXPECT().WakeTask(ctx, workspaceID, task.ID, gomock.Any()).Return(false, errors.New("system db down"))
+	d.taskService.EXPECT().ExecutePendingTasks(gomock.Any(), gomock.Any()).Times(0)
+
+	err := d.svc.SelectWinner(ctx, workspaceID, broadcastID, templateID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "system db down")
+}
+
+// Repeating the pick recorded on a broadcast in winner_selected saves nothing
+// again and wakes the task.
+func TestBroadcastService_SelectWinner_RepeatingTheRecordedPickWakesTheTask(t *testing.T) {
+	d := setupBroadcastSvc(t)
+	defer d.ctrl.Finish()
+
+	ctx := context.Background()
+	workspaceID := "w1"
+	broadcastID := "b1"
+	templateID := "tplA"
+	authOK(d.authService, ctx, workspaceID)
+
+	d.repo.EXPECT().WithTransaction(ctx, workspaceID, gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ string, fn func(*sql.Tx) error) error { return fn(nil) },
+	)
+	b := testBroadcast(workspaceID, broadcastID)
+	b.Status = domain.BroadcastStatusWinnerSelected
+	recorded := templateID
+	b.WinningTemplate = &recorded
+	b.TestSettings.Variations = []domain.BroadcastVariation{{VariationName: "A", TemplateID: templateID}, {VariationName: "B", TemplateID: "tplB"}}
+	d.repo.EXPECT().GetBroadcastForUpdateTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
+	d.repo.EXPECT().UpdateBroadcastTx(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+	task := &domain.Task{ID: "task1", WorkspaceID: workspaceID, Status: domain.TaskStatusPaused}
+	d.taskRepo.EXPECT().GetTaskByBroadcastID(ctx, workspaceID, broadcastID).Return(task, nil)
+	d.taskRepo.EXPECT().WakeTask(ctx, workspaceID, task.ID, gomock.Any()).Return(true, nil)
+	d.taskService.EXPECT().IsAutoExecuteEnabled().Return(false).AnyTimes()
+
+	require.NoError(t, d.svc.SelectWinner(ctx, workspaceID, broadcastID, templateID))
+}
+
+// Once the owner's pick is recorded and the broadcast waits for its run
+// (winner_selected), another pick is refused and wakes nothing.
+func TestBroadcastService_SelectWinner_RefusesADifferentPickOnceChosen(t *testing.T) {
+	d := setupBroadcastSvc(t)
+	defer d.ctrl.Finish()
+
+	ctx := context.Background()
+	workspaceID := "w1"
+	broadcastID := "b1"
+	authOK(d.authService, ctx, workspaceID)
+
+	d.repo.EXPECT().WithTransaction(ctx, workspaceID, gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ string, fn func(*sql.Tx) error) error { return fn(nil) },
+	)
+	b := testBroadcast(workspaceID, broadcastID)
+	b.Status = domain.BroadcastStatusWinnerSelected
+	recorded := "tplA"
+	b.WinningTemplate = &recorded
+	b.TestSettings.Variations = []domain.BroadcastVariation{{VariationName: "A", TemplateID: "tplA"}, {VariationName: "B", TemplateID: "tplB"}}
+	d.repo.EXPECT().GetBroadcastForUpdateTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
+	d.repo.EXPECT().UpdateBroadcastTx(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+	d.taskRepo.EXPECT().GetTaskByBroadcastID(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+	d.taskRepo.EXPECT().WakeTask(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+	err := d.svc.SelectWinner(ctx, workspaceID, broadcastID, "tplB")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not in test completed state")
 }
 
 func TestBroadcastService_SetTaskService_SetsField(t *testing.T) {
@@ -2353,7 +2459,7 @@ func TestBroadcastService_SelectWinner_InvalidStatus(t *testing.T) {
 		func(_ context.Context, _ string, fn func(*sql.Tx) error) error {
 			b := testBroadcast(workspaceID, broadcastID)
 			b.Status = domain.BroadcastStatusDraft // invalid status
-			d.repo.EXPECT().GetBroadcastTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
+			d.repo.EXPECT().GetBroadcastForUpdateTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
 			return fn(nil)
 		},
 	)
@@ -2378,7 +2484,7 @@ func TestBroadcastService_SelectWinner_InvalidTemplate(t *testing.T) {
 			b := testBroadcast(workspaceID, broadcastID)
 			b.Status = domain.BroadcastStatusTestCompleted
 			b.TestSettings.Variations = []domain.BroadcastVariation{{VariationName: "A", TemplateID: "tplA"}}
-			d.repo.EXPECT().GetBroadcastTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
+			d.repo.EXPECT().GetBroadcastForUpdateTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
 			return fn(nil)
 		},
 	)
@@ -2403,7 +2509,7 @@ func TestBroadcastService_SelectWinner_UpdateFailure(t *testing.T) {
 			b := testBroadcast(workspaceID, broadcastID)
 			b.Status = domain.BroadcastStatusTestCompleted
 			b.TestSettings.Variations = []domain.BroadcastVariation{{VariationName: "A", TemplateID: templateID}}
-			d.repo.EXPECT().GetBroadcastTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
+			d.repo.EXPECT().GetBroadcastForUpdateTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
 			d.repo.EXPECT().UpdateBroadcastTx(ctx, gomock.Any(), gomock.Any()).Return(errors.New("update failed"))
 			return fn(nil)
 		},
@@ -2429,7 +2535,7 @@ func TestBroadcastService_SelectWinner_TaskUpdateFailure(t *testing.T) {
 			b := testBroadcast(workspaceID, broadcastID)
 			b.Status = domain.BroadcastStatusTestCompleted
 			b.TestSettings.Variations = []domain.BroadcastVariation{{VariationName: "A", TemplateID: templateID}}
-			d.repo.EXPECT().GetBroadcastTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
+			d.repo.EXPECT().GetBroadcastForUpdateTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
 			d.repo.EXPECT().UpdateBroadcastTx(ctx, gomock.Any(), gomock.Any()).Return(nil)
 
 			task := &domain.Task{ID: "task1", WorkspaceID: workspaceID, Status: domain.TaskStatusPaused}
@@ -2459,7 +2565,7 @@ func TestBroadcastService_SelectWinner_NoTask(t *testing.T) {
 			b := testBroadcast(workspaceID, broadcastID)
 			b.Status = domain.BroadcastStatusTestCompleted
 			b.TestSettings.Variations = []domain.BroadcastVariation{{VariationName: "A", TemplateID: templateID}}
-			d.repo.EXPECT().GetBroadcastTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
+			d.repo.EXPECT().GetBroadcastForUpdateTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
 			d.repo.EXPECT().UpdateBroadcastTx(ctx, gomock.Any(), gomock.Any()).Return(nil)
 
 			// No task found - should not be an error
@@ -2713,8 +2819,8 @@ func TestBroadcastService_GetTestResults_WithAutoSendWinner(t *testing.T) {
 	d.repo.EXPECT().GetBroadcast(ctx, workspaceID, broadcastID).Return(b, nil)
 
 	// stats for A and B
-	d.messageHistoryRepo.EXPECT().GetBroadcastVariationStats(ctx, workspaceID, broadcastID, "tplA").Return(&domain.MessageHistoryStatusSum{TotalSent: 100, TotalDelivered: 100, TotalOpened: 30, TotalClicked: 5}, nil)
-	d.messageHistoryRepo.EXPECT().GetBroadcastVariationStats(ctx, workspaceID, broadcastID, "tplB").Return(&domain.MessageHistoryStatusSum{TotalSent: 100, TotalDelivered: 100, TotalOpened: 25, TotalClicked: 10}, nil)
+	d.messageHistoryRepo.EXPECT().GetBroadcastVariationStats(ctx, workspaceID, broadcastID, "tplA").Return(&domain.MessageHistoryStatusSum{TotalSent: 100, TotalDelivered: 100, TotalOpensTracked: 100, TotalClicksTracked: 100, TotalOpened: 30, TotalClicked: 5}, nil)
+	d.messageHistoryRepo.EXPECT().GetBroadcastVariationStats(ctx, workspaceID, broadcastID, "tplB").Return(&domain.MessageHistoryStatusSum{TotalSent: 100, TotalDelivered: 100, TotalOpensTracked: 100, TotalClicksTracked: 100, TotalOpened: 25, TotalClicked: 10}, nil)
 
 	res, err := d.svc.GetTestResults(ctx, workspaceID, broadcastID)
 	require.NoError(t, err)
@@ -2746,8 +2852,8 @@ func TestBroadcastService_GetTestResults_WithWinnerAlreadySelected(t *testing.T)
 	d.repo.EXPECT().GetBroadcast(ctx, workspaceID, broadcastID).Return(b, nil)
 
 	// stats for A and B
-	d.messageHistoryRepo.EXPECT().GetBroadcastVariationStats(ctx, workspaceID, broadcastID, "tplA").Return(&domain.MessageHistoryStatusSum{TotalSent: 100, TotalDelivered: 100, TotalOpened: 30, TotalClicked: 5}, nil)
-	d.messageHistoryRepo.EXPECT().GetBroadcastVariationStats(ctx, workspaceID, broadcastID, "tplB").Return(&domain.MessageHistoryStatusSum{TotalSent: 100, TotalDelivered: 100, TotalOpened: 25, TotalClicked: 10}, nil)
+	d.messageHistoryRepo.EXPECT().GetBroadcastVariationStats(ctx, workspaceID, broadcastID, "tplA").Return(&domain.MessageHistoryStatusSum{TotalSent: 100, TotalDelivered: 100, TotalOpensTracked: 100, TotalClicksTracked: 100, TotalOpened: 30, TotalClicked: 5}, nil)
+	d.messageHistoryRepo.EXPECT().GetBroadcastVariationStats(ctx, workspaceID, broadcastID, "tplB").Return(&domain.MessageHistoryStatusSum{TotalSent: 100, TotalDelivered: 100, TotalOpensTracked: 100, TotalClicksTracked: 100, TotalOpened: 25, TotalClicked: 10}, nil)
 
 	res, err := d.svc.GetTestResults(ctx, workspaceID, broadcastID)
 	require.NoError(t, err)
@@ -2805,7 +2911,7 @@ func TestBroadcastService_SelectWinner_DuringTestingPhase(t *testing.T) {
 			b.TestSettings.Enabled = true
 			b.TestSettings.AutoSendWinner = false // manual selection allowed
 			b.TestSettings.Variations = []domain.BroadcastVariation{{VariationName: "A", TemplateID: templateID}}
-			d.repo.EXPECT().GetBroadcastTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
+			d.repo.EXPECT().GetBroadcastForUpdateTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
 			d.repo.EXPECT().UpdateBroadcastTx(ctx, gomock.Any(), gomock.Any()).Return(nil)
 
 			// No task found - should not be an error
@@ -2835,7 +2941,7 @@ func TestBroadcastService_SelectWinner_DuringSendingPhase(t *testing.T) {
 			b.TestSettings.Enabled = true
 			b.TestSettings.AutoSendWinner = false // manual selection allowed
 			b.TestSettings.Variations = []domain.BroadcastVariation{{VariationName: "A", TemplateID: templateID}}
-			d.repo.EXPECT().GetBroadcastTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
+			d.repo.EXPECT().GetBroadcastForUpdateTx(ctx, gomock.Any(), workspaceID, broadcastID).Return(b, nil)
 			d.repo.EXPECT().UpdateBroadcastTx(ctx, gomock.Any(), gomock.Any()).Return(nil)
 
 			// No task found - should not be an error
@@ -3855,4 +3961,77 @@ func TestBroadcastService_PauseForCircuitBreaker(t *testing.T) {
 		err := d.svc.PauseForCircuitBreaker(context.Background(), "w1", "intg-1", "down")
 		require.NoError(t, err)
 	})
+}
+
+// A test send shows what recipients get (issue #484): a broadcast that keeps the list's
+// unsubscribed contacts hands the provider no List-Unsubscribe URL, one that excludes them
+// does.
+func TestBroadcastService_SendToIndividual_ListUnsubscribeHeader(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		excludeUnsubscribed bool
+		wantURL             bool
+	}{
+		{"excludes unsubscribed contacts: URL sent", true, true},
+		{"includes unsubscribed contacts: no URL", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := setupBroadcastSvc(t)
+			defer d.ctrl.Finish()
+
+			ctx := context.Background()
+			req := &domain.SendToIndividualRequest{WorkspaceID: "w1", BroadcastID: "b1", RecipientEmail: "to@example.com"}
+			authOK(d.authService, ctx, req.WorkspaceID)
+
+			sender := domain.NewEmailSender("from@example.com", "From")
+			workspace := &domain.Workspace{
+				ID:       "w1",
+				Settings: domain.WorkspaceSettings{MarketingEmailProviderID: "mkt", SecretKey: "sk_test"},
+				Integrations: domain.Integrations{
+					{ID: "mkt", Type: domain.IntegrationTypeEmail, EmailProvider: domain.EmailProvider{Kind: domain.EmailProviderKindSMTP, Senders: []domain.EmailSender{sender}}},
+				},
+			}
+			d.workspaceRepo.EXPECT().GetByID(ctx, req.WorkspaceID).Return(workspace, nil)
+
+			b := testBroadcast(req.WorkspaceID, req.BroadcastID)
+			b.Audience.ExcludeUnsubscribed = tc.excludeUnsubscribed
+			d.repo.EXPECT().GetBroadcast(ctx, req.WorkspaceID, req.BroadcastID).Return(b, nil)
+
+			// The one-click URL is only built for a known contact.
+			d.contactRepo.EXPECT().GetContactByEmail(ctx, req.WorkspaceID, req.RecipientEmail).
+				Return(&domain.Contact{Email: req.RecipientEmail}, nil)
+
+			template := &domain.Template{
+				ID:      "tplA",
+				Name:    "Template A",
+				Channel: "email",
+				Email: &domain.EmailTemplate{
+					SenderID:         sender.ID,
+					Subject:          "Hello",
+					VisualEditorTree: createMJMLRootBlock(),
+				},
+				Category: string(domain.TemplateCategoryMarketing),
+			}
+			d.templateSvc.EXPECT().GetTemplateByID(ctx, req.WorkspaceID, "tplA", int64(0)).Return(template, nil)
+
+			compiledHTML := "<html>ok</html>"
+			d.templateSvc.EXPECT().CompileTemplate(ctx, gomock.Any()).
+				Return(&domain.CompileTemplateResponse{Success: true, HTML: &compiledHTML}, nil)
+
+			var sent domain.SendEmailProviderRequest
+			d.emailSvc.EXPECT().SendEmail(gomock.Any(), gomock.Any(), true).
+				DoAndReturn(func(_ context.Context, request domain.SendEmailProviderRequest, _ bool) error {
+					sent = request
+					return nil
+				})
+			d.messageHistoryRepo.EXPECT().Create(gomock.Any(), req.WorkspaceID, gomock.Any(), gomock.Any()).Return(nil)
+
+			require.NoError(t, d.svc.SendToIndividual(ctx, req))
+			if tc.wantURL {
+				assert.Contains(t, sent.EmailOptions.ListUnsubscribeURL, "/unsubscribe-oneclick?")
+			} else {
+				assert.Empty(t, sent.EmailOptions.ListUnsubscribeURL)
+			}
+		})
+	}
 }

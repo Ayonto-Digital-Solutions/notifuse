@@ -857,8 +857,53 @@ func TestSanitizeClickedURL_IdentifyTokenStripping(t *testing.T) {
 			expected: "http://user:pw@shop.example.com:8443/product",
 		},
 		{
+			name:     "A stray percent sign is recorded as written",
+			url:      "https://shop.example.com/50%off?nf_id=abc123&utm_source=news",
+			expected: "https://shop.example.com/50%off?utm_source=news",
+		},
+		{
+			name:     "An invalid escape is recorded as written",
+			url:      "https://shop.example.com/%zz",
+			expected: "https://shop.example.com/%zz",
+		},
+		{
+			name:     "Surrounding spaces and line breaks are trimmed from the recorded key",
+			url:      " https://shop.example.com/sa\r\nle?nf_id=abc123 ",
+			expected: "https://shop.example.com/sale",
+		},
+		{
+			name:     "A trailing space net/url accepts keeps the key it was always recorded under",
+			url:      "https://shop.example.com/sale ",
+			expected: "https://shop.example.com/sale ",
+		},
+		{
+			name:     "A percent sign in the host is not a destination",
+			url:      "https://click.notifuse.test%/unsubscribe?email=someone@example.com",
+			expected: "",
+		},
+		{
+			name:     "A percent sign in the host is not a destination, escaped either",
+			url:      "https://click.notifuse.test%25/unsubscribe?email=someone@example.com",
+			expected: "",
+		},
+		{
+			name:     "An IPv6 zone is not refused for its percent sign",
+			url:      "https://[fe80::1%25en0]/50%off",
+			expected: "https://[fe80::1%25en0]/50%off",
+		},
+		{
+			name:     "A stray percent sign does not rescue a link back to the request host",
+			url:      "https://click.notifuse.test/50%off",
+			expected: "",
+		},
+		{
+			name:     "A stray percent sign does not rescue a non-http scheme",
+			url:      "ftp://files.example.com/50%off",
+			expected: "",
+		},
+		{
 			name:     "Unparseable URL degrades to aggregate-only",
-			url:      "https://shop.example.com/%zz?nf_id=abc123",
+			url:      "https://shop example.com/product?nf_id=abc123",
 			expected: "",
 		},
 		{
@@ -1936,6 +1981,14 @@ func sendForTemplateCapturingTrackingWithOptions(t *testing.T, webAnalytics *dom
 // send — the value SendEmailForTemplate carries into the compiler.
 func sendForTemplateCapturingTrackingWithRequestSettings(t *testing.T, webAnalytics *domain.WebAnalyticsSettings, contactEmail string, secretKey string, emailOptions domain.EmailOptions, requestTracking notifuse_mjml.TrackingSettings) notifuse_mjml.TrackingSettings {
 	t.Helper()
+	captured, _ := sendForTemplateCapturingTrackingAndHistory(t, webAnalytics, contactEmail, secretKey, emailOptions, requestTracking)
+	return captured
+}
+
+// sendForTemplateCapturingTrackingAndHistory is the same send, also returning
+// the message history row the send records.
+func sendForTemplateCapturingTrackingAndHistory(t *testing.T, webAnalytics *domain.WebAnalyticsSettings, contactEmail string, secretKey string, emailOptions domain.EmailOptions, requestTracking notifuse_mjml.TrackingSettings) (notifuse_mjml.TrackingSettings, *domain.MessageHistory) {
+	t.Helper()
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -1998,9 +2051,13 @@ func sendForTemplateCapturingTrackingWithRequestSettings(t *testing.T, webAnalyt
 			captured = req.TrackingSettings
 			return &domain.CompileTemplateResponse{Success: true, HTML: &compiledHTML}, nil
 		})
+	var history *domain.MessageHistory
 	mockMessageRepo.EXPECT().
 		Create(gomock.Any(), workspaceID, gomock.Any(), gomock.Any()).
-		Return(nil)
+		DoAndReturn(func(_ context.Context, _, _ string, m *domain.MessageHistory) error {
+			history = m
+			return nil
+		})
 	mockSESService.EXPECT().
 		SendEmail(gomock.Any(), gomock.Any()).
 		Return(nil)
@@ -2021,7 +2078,7 @@ func sendForTemplateCapturingTrackingWithRequestSettings(t *testing.T, webAnalyt
 	}
 	require.NoError(t, emailService.SendEmailForTemplate(context.Background(), request))
 
-	return captured
+	return captured, history
 }
 
 // TestEmailService_SendEmailForTemplate_WebIdentity covers the "identified with
@@ -2226,7 +2283,7 @@ func TestEmailService_SendEmailForTemplate_WebIdentityTrackingMode(t *testing.T)
 
 	t.Run("Mints nothing when the notification opts out of tracking", func(t *testing.T) {
 		// What the transactional service actually hands this method for an
-		// opted-out notification: effectiveTracking resolves EnableTracking to
+		// opted-out notification: recipientTrackingSettings resolves EnableTracking to
 		// false, and the mode rides along.
 		tracking := send(t, notifuse_mjml.TrackingSettings{
 			TrackingMode:   notifuse_mjml.TrackingModeDisabled,
@@ -2437,4 +2494,60 @@ func TestSendEmailForTemplate_SetsTrackingSigningKey(t *testing.T) {
 			assert.Equal(t, want, tracking.SigningKey)
 		})
 	}
+}
+
+func TestEmailService_SendEmailForTemplate_CarriesTrackingDecision(t *testing.T) {
+	const secretKey = "workspace-secret-key-32-chars-min!"
+	const contactEmail = "test@example.com"
+	webAnalytics := func() *domain.WebAnalyticsSettings {
+		return &domain.WebAnalyticsSettings{Enabled: true, IdentifyFromEmailLinks: true, AllowedDomains: []string{"shop.example.com"}}
+	}
+
+	t.Run("suppress flags survive the rebuild and set the message flags", func(t *testing.T) {
+		tracking, history := sendForTemplateCapturingTrackingAndHistory(t, webAnalytics(), contactEmail, secretKey, domain.EmailOptions{},
+			notifuse_mjml.TrackingSettings{EnableTracking: true, SuppressOpens: true})
+
+		assert.True(t, tracking.SuppressOpens)
+		assert.False(t, tracking.SuppressClicks)
+		require.NotNil(t, history)
+		require.NotNil(t, history.OpensTracked)
+		require.NotNil(t, history.ClicksTracked)
+		assert.False(t, *history.OpensTracked)
+		assert.True(t, *history.ClicksTracked)
+	})
+
+	t.Run("SuppressIdentify mints no token", func(t *testing.T) {
+		tracking, _ := sendForTemplateCapturingTrackingAndHistory(t, webAnalytics(), contactEmail, secretKey, domain.EmailOptions{},
+			notifuse_mjml.TrackingSettings{EnableTracking: true, SuppressClicks: true, SuppressIdentify: true})
+
+		assert.True(t, tracking.SuppressIdentify)
+		assert.Empty(t, tracking.IdentifyToken)
+		assert.Empty(t, tracking.IdentifyAllowedHosts)
+	})
+
+	t.Run("no_tracking mints no token and records nothing tracked", func(t *testing.T) {
+		tracking, history := sendForTemplateCapturingTrackingAndHistory(t, webAnalytics(), contactEmail, secretKey, domain.EmailOptions{},
+			notifuse_mjml.TrackingSettings{TrackingMode: notifuse_mjml.TrackingModeNoTracking})
+
+		assert.Empty(t, tracking.IdentifyToken)
+		assert.False(t, *history.OpensTracked)
+		assert.False(t, *history.ClicksTracked)
+	})
+
+	t.Run("workspace click tracking off alone still identifies", func(t *testing.T) {
+		tracking, history := sendForTemplateCapturingTrackingAndHistory(t, webAnalytics(), contactEmail, secretKey, domain.EmailOptions{},
+			notifuse_mjml.TrackingSettings{EnableTracking: true, SuppressClicks: true})
+
+		assert.NotEmpty(t, tracking.IdentifyToken)
+		assert.True(t, *history.OpensTracked)
+		assert.False(t, *history.ClicksTracked)
+	})
+
+	t.Run("disabled records nothing tracked even if flagged on", func(t *testing.T) {
+		_, history := sendForTemplateCapturingTrackingAndHistory(t, webAnalytics(), contactEmail, secretKey, domain.EmailOptions{},
+			notifuse_mjml.TrackingSettings{EnableTracking: true, TrackingMode: notifuse_mjml.TrackingModeDisabled})
+
+		assert.False(t, *history.OpensTracked)
+		assert.False(t, *history.ClicksTracked)
+	})
 }

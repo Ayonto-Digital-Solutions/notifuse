@@ -753,7 +753,7 @@ func TestBroadcastOrchestrator_Process(t *testing.T) {
 					"secret-key",
 					gomock.Any(),
 					gomock.Any(),
-					true, gomock.Any(),
+					domain.EmailTrackingPolicy{OpensEnabled: true, ClicksEnabled: true, UnknownConsent: domain.UnknownConsentTrack}, gomock.Any(),
 					"broadcast-123",
 					recipients,
 					gomock.Any(),
@@ -885,7 +885,7 @@ func TestBroadcastOrchestrator_Process(t *testing.T) {
 					"marketing-provider-id", "secret-key",
 					gomock.Any(),
 					gomock.Any(),
-					true, gomock.Any(),
+					domain.EmailTrackingPolicy{OpensEnabled: true, ClicksEnabled: true, UnknownConsent: domain.UnknownConsentTrack}, gomock.Any(),
 					"broadcast-123",
 					recipients,
 					gomock.Any(),
@@ -1328,7 +1328,7 @@ func TestBroadcastOrchestrator_Process(t *testing.T) {
 					"marketing-provider-id", "secret-key",
 					gomock.Any(),
 					gomock.Any(),
-					true, gomock.Any(),
+					domain.EmailTrackingPolicy{OpensEnabled: true, ClicksEnabled: true, UnknownConsent: domain.UnknownConsentTrack}, gomock.Any(),
 					"broadcast-456",
 					recipients,
 					gomock.Any(),
@@ -1479,13 +1479,14 @@ func TestBroadcastOrchestrator_Process_ABTestStartSetsTestingAndCompletesTestPha
 	// GetBroadcast can be called multiple times
 	mockBroadcastRepo.EXPECT().GetBroadcast(gomock.Any(), "workspace-123", "broadcast-123").Return(bcast, nil).AnyTimes()
 
-	// Expect status update to testing, then to test_completed
+	// Expect status update to testing, then test_completed under the row lock
 	mockBroadcastRepo.EXPECT().UpdateBroadcast(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, b *domain.Broadcast) error {
-		if b.Status == domain.BroadcastStatusTesting || b.Status == domain.BroadcastStatusTestCompleted {
+		if b.Status == domain.BroadcastStatusTesting {
 			return nil
 		}
 		return fmt.Errorf("unexpected status: %s", b.Status)
-	}).Times(2)
+	}).Times(1)
+	expectLockedTestCompletion(t, mockBroadcastRepo, bcast)
 
 	// Template
 	tpl := &domain.Template{ID: "template-1", Email: &domain.EmailTemplate{Subject: "S", SenderID: "s", VisualEditorTree: &notifuse_mjml.MJMLBlock{BaseBlock: notifuse_mjml.NewBaseBlock("root", notifuse_mjml.MJMLComponentMjml)}}}
@@ -1496,7 +1497,7 @@ func TestBroadcastOrchestrator_Process_ABTestStartSetsTestingAndCompletesTestPha
 	mockContactRepo.EXPECT().GetContactsForBroadcast(gomock.Any(), "workspace-123", bcast.Audience, 1, "").Return(recipients, nil)
 
 	// Send batch
-	mockMessageSender.EXPECT().SendBatch(gomock.Any(), "workspace-123", "marketing-provider-id", "secret-key", gomock.Any(), gomock.Any(), true, gomock.Any(), "broadcast-123", recipients, gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(1, 0, nil)
+	mockMessageSender.EXPECT().SendBatch(gomock.Any(), "workspace-123", "marketing-provider-id", "secret-key", gomock.Any(), gomock.Any(), domain.EmailTrackingPolicy{OpensEnabled: true, ClicksEnabled: true, UnknownConsent: domain.UnknownConsentTrack}, gomock.Any(), "broadcast-123", recipients, gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(1, 0, nil)
 
 	// Save state
 	mockTaskRepo.EXPECT().SaveState(gomock.Any(), "workspace-123", "task-123", gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
@@ -1679,8 +1680,9 @@ func TestBroadcastOrchestrator_Process_BatchSizeZeroTriggersPhaseCompletion(t *t
 	bcast := &domain.Broadcast{ID: "b", WorkspaceID: "w", Audience: domain.AudienceSettings{}, Status: domain.BroadcastStatusProcessing, TestSettings: domain.BroadcastTestSettings{Enabled: true, Variations: []domain.BroadcastVariation{{TemplateID: "tpl"}}, SamplePercentage: 100}}
 	mockBroadcastRepo.EXPECT().GetBroadcast(gomock.Any(), "w", "b").Return(bcast, nil).AnyTimes()
 
-	// First UpdateBroadcast to testing during phase init, second to test_completed in handleTestPhaseCompletion
-	mockBroadcastRepo.EXPECT().UpdateBroadcast(gomock.Any(), gomock.Any()).Return(nil).Times(2)
+	// UpdateBroadcast to testing during phase init, then test_completed under the row lock
+	mockBroadcastRepo.EXPECT().UpdateBroadcast(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+	expectLockedTestCompletion(t, mockBroadcastRepo, bcast)
 
 	tpl := &domain.Template{ID: "tpl", Email: &domain.EmailTemplate{Subject: "s", SenderID: "x", VisualEditorTree: &notifuse_mjml.MJMLBlock{BaseBlock: notifuse_mjml.NewBaseBlock("root", notifuse_mjml.MJMLComponentMjml)}}}
 	mockTemplateRepo.EXPECT().GetTemplateByID(gomock.Any(), "w", "tpl", int64(0)).Return(tpl, nil)
@@ -1731,8 +1733,9 @@ func TestBroadcastOrchestrator_Process_EmptyRecipientsTriggersTestCompletion(t *
 	bcast := &domain.Broadcast{ID: "b", WorkspaceID: "w", Audience: domain.AudienceSettings{List: "l"}, Status: domain.BroadcastStatusProcessing, TestSettings: domain.BroadcastTestSettings{Enabled: true, Variations: []domain.BroadcastVariation{{TemplateID: "tpl"}}, SamplePercentage: 100}}
 	mockBroadcastRepo.EXPECT().GetBroadcast(gomock.Any(), "w", "b").Return(bcast, nil).AnyTimes()
 
-	// Update to testing then to test_completed
-	mockBroadcastRepo.EXPECT().UpdateBroadcast(gomock.Any(), gomock.Any()).Return(nil).Times(2)
+	// Update to testing, then test_completed under the row lock
+	mockBroadcastRepo.EXPECT().UpdateBroadcast(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+	expectLockedTestCompletion(t, mockBroadcastRepo, bcast)
 
 	tpl := &domain.Template{ID: "tpl", Email: &domain.EmailTemplate{Subject: "s", SenderID: "x", VisualEditorTree: &notifuse_mjml.MJMLBlock{BaseBlock: notifuse_mjml.NewBaseBlock("root", notifuse_mjml.MJMLComponentMjml)}}}
 	mockTemplateRepo.EXPECT().GetTemplateByID(gomock.Any(), "w", "tpl", int64(0)).Return(tpl, nil)
@@ -1808,12 +1811,22 @@ func TestBroadcastOrchestrator_Process_AutoWinnerEvaluationPath(t *testing.T) {
 	abEval := broadcast.NewABTestEvaluator(msgRepo, mockBroadcastRepo, mockLogger)
 
 	// Stats prefer tplB
-	msgRepo.EXPECT().GetBroadcastVariationStats(gomock.Any(), "w", "b", "tplA").Return(&domain.MessageHistoryStatusSum{TotalDelivered: 100, TotalOpened: 10}, nil)
-	msgRepo.EXPECT().GetBroadcastVariationStats(gomock.Any(), "w", "b", "tplB").Return(&domain.MessageHistoryStatusSum{TotalDelivered: 100, TotalOpened: 60}, nil)
+	msgRepo.EXPECT().GetBroadcastVariationStats(gomock.Any(), "w", "b", "tplA").Return(&domain.MessageHistoryStatusSum{TotalDelivered: 100, TotalOpensTracked: 100, TotalClicksTracked: 100, TotalOpened: 10}, nil)
+	msgRepo.EXPECT().GetBroadcastVariationStats(gomock.Any(), "w", "b", "tplB").Return(&domain.MessageHistoryStatusSum{TotalDelivered: 100, TotalOpensTracked: 100, TotalClicksTracked: 100, TotalOpened: 60}, nil)
 
 	// Transaction and update during evaluation
 	mockBroadcastRepo.EXPECT().WithTransaction(gomock.Any(), "w", gomock.Any()).DoAndReturn(func(_ context.Context, _ string, fn func(*sql.Tx) error) error { return fn(nil) })
-	mockBroadcastRepo.EXPECT().UpdateBroadcastTx(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+	// The locked read is its own row, not the run's copy: the evaluator must write it.
+	locked := *bcast
+	mockBroadcastRepo.EXPECT().GetBroadcastForUpdateTx(gomock.Any(), gomock.Any(), "w", "b").Return(&locked, nil)
+	mockBroadcastRepo.EXPECT().UpdateBroadcastTx(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ *sql.Tx, updated *domain.Broadcast) error {
+			assert.Same(t, &locked, updated)
+			require.NotNil(t, updated.WinningTemplate)
+			assert.Equal(t, "tplB", *updated.WinningTemplate)
+			return nil
+		},
+	)
 
 	// After evaluation, phase becomes winner; ensure we can proceed with winner phase template
 	// Provide winning template id in refreshed broadcast
@@ -1840,7 +1853,7 @@ func TestBroadcastOrchestrator_Process_AutoWinnerEvaluationPath(t *testing.T) {
 	mockContactRepo.EXPECT().GetContactsForBroadcast(gomock.Any(), "w", bcast.Audience, 1, "").Return([]*domain.ContactWithList{{Contact: &domain.Contact{Email: "w@x.com"}}}, nil)
 
 	// Send
-	mockMessageSender.EXPECT().SendBatch(gomock.Any(), "w", "pid", "k", gomock.Any(), gomock.Any(), true, gomock.Any(), "b", gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(1, 0, nil)
+	mockMessageSender.EXPECT().SendBatch(gomock.Any(), "w", "pid", "k", gomock.Any(), gomock.Any(), domain.EmailTrackingPolicy{OpensEnabled: true, ClicksEnabled: true, UnknownConsent: domain.UnknownConsentTrack}, gomock.Any(), "b", gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(1, 0, nil)
 
 	// Save state
 	mockTaskRepo.EXPECT().SaveState(gomock.Any(), "w", "t", gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
@@ -1977,7 +1990,7 @@ func TestBroadcastOrchestrator_Process_ABTestWinnerPhaseProcessesRemainingRecipi
 		"marketing-provider-id", "secret-key",
 		gomock.Any(), // custom endpoint
 		gomock.Any(),
-		true, gomock.Any(),
+		domain.EmailTrackingPolicy{OpensEnabled: true, ClicksEnabled: true, UnknownConsent: domain.UnknownConsentTrack}, gomock.Any(),
 		"broadcast-123",
 		[]*domain.ContactWithList{recipient},
 		gomock.Any(), // templates
@@ -2936,14 +2949,14 @@ func TestBroadcastOrchestrator_Process_PartialBatchCursorUpdate(t *testing.T) {
 		"secret-key",
 		gomock.Any(),
 		gomock.Any(),
-		true, gomock.Any(),
+		domain.EmailTrackingPolicy{OpensEnabled: true, ClicksEnabled: true, UnknownConsent: domain.UnknownConsentTrack}, gomock.Any(),
 		"broadcast-123",
 		recipients1,
 		gomock.Any(),
 		gomock.Any(),
 		gomock.Any(),
 		gomock.Any(),
-	).DoAndReturn(func(_ context.Context, _, _, _, _, _ interface{}, _ bool, _ interface{}, _ string, _ []*domain.ContactWithList, _, _, _, _ interface{}) (int, int, error) {
+	).DoAndReturn(func(_ context.Context, _, _, _, _, _ interface{}, _ domain.EmailTrackingPolicy, _ interface{}, _ string, _ []*domain.ContactWithList, _, _, _, _ interface{}) (int, int, error) {
 		sendBatchCalled = true
 		return 3, 0, nil // Only 3 sent due to internal timeout
 	})
@@ -2955,7 +2968,7 @@ func TestBroadcastOrchestrator_Process_PartialBatchCursorUpdate(t *testing.T) {
 		"secret-key",
 		gomock.Any(),
 		gomock.Any(),
-		true, gomock.Any(),
+		domain.EmailTrackingPolicy{OpensEnabled: true, ClicksEnabled: true, UnknownConsent: domain.UnknownConsentTrack}, gomock.Any(),
 		"broadcast-123",
 		recipients2,
 		gomock.Any(),
@@ -3107,7 +3120,7 @@ func TestProcessBroadcastTask_RecipientFeedFailure_PausesBroadcast(t *testing.T)
 
 	// SendBatch returns ErrBroadcastShouldPause
 	mockMessageSender.EXPECT().SendBatch(
-		gomock.Any(), "workspace-123", "marketing-provider-id", "secret-key", gomock.Any(), gomock.Any(), true, gomock.Any(), "broadcast-123",
+		gomock.Any(), "workspace-123", "marketing-provider-id", "secret-key", gomock.Any(), gomock.Any(), domain.EmailTrackingPolicy{OpensEnabled: true, ClicksEnabled: true, UnknownConsent: domain.UnknownConsentTrack}, gomock.Any(), "broadcast-123",
 		recipients, gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
 	).Return(0, 0, fmt.Errorf("%w: recipient feed failed for user1@test.com: server error", broadcast.ErrBroadcastShouldPause))
 
@@ -3220,7 +3233,7 @@ func TestProcessBroadcastTask_RecipientFeedFailure_NotMarkedAsFailed(t *testing.
 
 	// SendBatch returns ErrBroadcastShouldPause
 	mockMessageSender.EXPECT().SendBatch(
-		gomock.Any(), "workspace-123", "marketing-provider-id", "secret-key", gomock.Any(), gomock.Any(), true, gomock.Any(), "broadcast-123",
+		gomock.Any(), "workspace-123", "marketing-provider-id", "secret-key", gomock.Any(), gomock.Any(), domain.EmailTrackingPolicy{OpensEnabled: true, ClicksEnabled: true, UnknownConsent: domain.UnknownConsentTrack}, gomock.Any(), "broadcast-123",
 		recipients, gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
 	).Return(0, 0, fmt.Errorf("%w: recipient feed failed for user1@test.com: server error", broadcast.ErrBroadcastShouldPause))
 
@@ -3256,4 +3269,25 @@ func TestProcessBroadcastTask_RecipientFeedFailure_NotMarkedAsFailed(t *testing.
 	assert.False(t, done)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, broadcast.ErrBroadcastShouldPause))
+}
+
+// expectLockedTestCompletion expects the end of a test phase: the row read again
+// under its lock, returned as its own copy in the test phase with no winner, and
+// the run's copy (the broadcast the run loaded, b) written as test_completed in
+// that transaction.
+func expectLockedTestCompletion(t *testing.T, repo *domainmocks.MockBroadcastRepository, b *domain.Broadcast) {
+	t.Helper()
+	repo.EXPECT().WithTransaction(gomock.Any(), b.WorkspaceID, gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ string, fn func(*sql.Tx) error) error { return fn(nil) },
+	)
+	locked := *b
+	locked.Status = domain.BroadcastStatusTesting
+	repo.EXPECT().GetBroadcastForUpdateTx(gomock.Any(), gomock.Any(), b.WorkspaceID, b.ID).Return(&locked, nil)
+	repo.EXPECT().UpdateBroadcastTx(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ *sql.Tx, updated *domain.Broadcast) error {
+			assert.Same(t, b, updated, "the run's copy is written")
+			assert.Equal(t, domain.BroadcastStatusTestCompleted, updated.Status)
+			return nil
+		},
+	)
 }

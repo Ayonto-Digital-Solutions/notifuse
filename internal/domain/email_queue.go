@@ -89,6 +89,11 @@ type EmailQueuePayload struct {
 	// and records the recipient-visible Message-ID for reply matching. Absent for
 	// all other sends (the feature is free for everyone else).
 	ContactAutomationID *string `json:"contact_automation_id,omitempty"`
+
+	// OpensTracked and ClicksTracked record what the compiled HTML carries, for
+	// message_history. An entry queued before they existed has neither.
+	OpensTracked  *bool `json:"opens_tracked,omitempty"`
+	ClicksTracked *bool `json:"clicks_tracked,omitempty"`
 }
 
 // ToSendEmailProviderRequest converts the payload to a SendEmailProviderRequest
@@ -172,6 +177,11 @@ type EmailQueueRepository interface {
 
 	// MarkAsFailed marks an entry as failed and schedules retry
 	MarkAsFailed(ctx context.Context, workspaceID string, id string, errorMsg string, nextRetryAt *time.Time) error
+
+	// ReleaseThrottled gives back a row whose send the provider refused for its pace:
+	// the row is due again at once and the attempt its claim counted is returned. Only
+	// a row still processing is changed.
+	ReleaseThrottled(ctx context.Context, workspaceID string, id string, errorMsg string) error
 
 	// Delete removes a queue entry
 	Delete(ctx context.Context, workspaceID string, entryID string) error

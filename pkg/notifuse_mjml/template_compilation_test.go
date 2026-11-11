@@ -929,64 +929,6 @@ func TestTrackLinks_EncryptsTheDecodedURL(t *testing.T) {
 	}
 }
 
-func TestGetTrackingURL(t *testing.T) {
-	trackingSettings := TrackingSettings{
-		EnableTracking: true,
-		Endpoint:       "https://track.example.com/redirect",
-		UTMSource:      "email",
-		UTMMedium:      "newsletter",
-		UTMCampaign:    "test-campaign",
-		WorkspaceID:    "test-workspace",
-		MessageID:      "test-message",
-	}
-
-	tests := []struct {
-		name     string
-		inputURL string
-		expected string
-	}{
-		{
-			name:     "Basic URL with UTM parameters",
-			inputURL: "https://example.com",
-			expected: "https://track.example.com/redirect?url=https%3A%2F%2Fexample.com%3Futm_campaign%3Dtest-campaign%26utm_medium%3Dnewsletter%26utm_source%3Demail",
-		},
-		{
-			name:     "URL with existing UTM parameters",
-			inputURL: "https://example.com?utm_source=existing",
-			expected: "https://track.example.com/redirect?url=https%3A%2F%2Fexample.com%3Futm_source%3Dexisting",
-		},
-		{
-			name:     "Mailto URL should not be modified",
-			inputURL: "mailto:test@example.com",
-			expected: "mailto:test@example.com",
-		},
-		{
-			name:     "Tel URL should not be modified",
-			inputURL: "tel:+1234567890",
-			expected: "tel:+1234567890",
-		},
-		{
-			name:     "Liquid template URL should not be modified",
-			inputURL: "https://example.com/{{ user.id }}",
-			expected: "https://example.com/{{ user.id }}",
-		},
-		{
-			name:     "Empty URL should not be modified",
-			inputURL: "",
-			expected: "",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			result := trackingSettings.GetTrackingURL(test.inputURL)
-			if result != test.expected {
-				t.Errorf("Expected %q, got %q", test.expected, result)
-			}
-		})
-	}
-}
-
 func TestCompileTemplateWithTracking(t *testing.T) {
 	// Create a simple email with button
 	textBase := NewBaseBlock("text-1", MJMLComponentMjText)
@@ -3938,19 +3880,6 @@ func TestTrackLinks_InheritAndUnsetModesKeepRewriting(t *testing.T) {
 	}
 }
 
-func TestGetTrackingURL_DisabledModeReturnsURLUnmodified(t *testing.T) {
-	settings := &TrackingSettings{
-		TrackingMode:   TrackingModeDisabled,
-		EnableTracking: true,
-		UTMSource:      "auth",
-		Endpoint:       "https://api.example.com/visit",
-	}
-	src := "https://example.com/auth/confirm?token=abc"
-	if got := settings.GetTrackingURL(src); got != src {
-		t.Errorf("opted-out URL must be returned unmodified, got: %s", got)
-	}
-}
-
 func TestValidateTrackingMode(t *testing.T) {
 	for _, valid := range []string{"", TrackingModeInherit, TrackingModeDisabled} {
 		if err := ValidateTrackingMode(valid); err != nil {
@@ -4165,6 +4094,21 @@ func TestApplyIdentityParam_PreservesURLBytes(t *testing.T) {
 			name:    "bare percent sign",
 			linkURL: "https://example.com/page?discount=50%off",
 			want:    "https://example.com/page?discount=50%off&nf_id=tok-abc123",
+		},
+		{
+			name:    "bare percent sign in the path",
+			linkURL: "https://example.com/50%off",
+			want:    "https://example.com/50%off?nf_id=tok-abc123",
+		},
+		{
+			name:    "a percent sign in the host is not a link",
+			linkURL: "https://example.com%/page",
+			want:    "https://example.com%/page",
+		},
+		{
+			name:    "an escaped percent sign in the host is not a link either",
+			linkURL: "https://example.com%25/page",
+			want:    "https://example.com%25/page",
 		},
 		{
 			name:    "order, slashes and commas kept",
@@ -4694,10 +4638,16 @@ func TestApplyUTMParameters_DefensiveCases(t *testing.T) {
 		"{{ unsubscribe_url }}",
 		"{% if x %}https://example.com{% endif %}",
 		"://example.com/broken",
-		"https://example.com/50%off/page", // invalid percent-escape in the path
+		"https://example.com%/page",   // the repair of invalid escapes never rescues a host
+		"https://example.com%25/page", // nor does a valid escape put a '%' in one
 	} {
 		assert.Equal(t, sourceURL, settings.applyUTMParameters(sourceURL))
 	}
+
+	// An invalid percent-escape in the path is a link browsers open: it is tagged,
+	// and its own bytes are kept as written.
+	assert.Equal(t, "https://example.com/50%off/page?utm_source=email",
+		settings.applyUTMParameters("https://example.com/50%off/page"))
 
 	// A relative link is still a link: it is what an mj-button pointing at the
 	// hosted page carries, and it must be tagged like any other.

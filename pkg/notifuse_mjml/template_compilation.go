@@ -136,13 +136,16 @@ func preprocessMjmlForXML(mjmlString string) string {
 // MapOfAny represents a map of string to any value, used for template data
 type MapOfAny map[string]any
 
-// Per-notification tracking modes. The zero value ("") and TrackingModeInherit
-// both follow the workspace tracking flag; TrackingModeDisabled suppresses all
-// rewriting (redirect, pixel, and UTM parameters) because opted-out
-// notifications carry single-use auth URLs that must never be modified.
+// Per-send tracking modes. The zero value ("") and TrackingModeInherit both
+// follow the workspace tracking policy and the recipient's consent;
+// TrackingModeNoTracking turns open and click tracking off for the send but
+// keeps the UTM parameters; TrackingModeDisabled suppresses all rewriting
+// (redirect, pixel, and UTM parameters) because opted-out notifications carry
+// single-use auth URLs that must never be modified.
 const (
-	TrackingModeInherit  = "inherit"
-	TrackingModeDisabled = "disabled"
+	TrackingModeInherit    = "inherit"
+	TrackingModeNoTracking = "no_tracking"
+	TrackingModeDisabled   = "disabled"
 )
 
 // WebIdentifyQueryParam is the URL parameter a tracked link carries so the web
@@ -158,10 +161,10 @@ const WebIdentifyQueryParam = "nf_id"
 // ValidateTrackingMode rejects unknown tracking mode values.
 func ValidateTrackingMode(mode string) error {
 	switch mode {
-	case "", TrackingModeInherit, TrackingModeDisabled:
+	case "", TrackingModeInherit, TrackingModeNoTracking, TrackingModeDisabled:
 		return nil
 	default:
-		return fmt.Errorf("invalid tracking_mode %q: must be %q or %q", mode, TrackingModeInherit, TrackingModeDisabled)
+		return fmt.Errorf("invalid tracking_mode %q: must be %q, %q or %q", mode, TrackingModeInherit, TrackingModeNoTracking, TrackingModeDisabled)
 	}
 }
 
@@ -193,6 +196,60 @@ type TrackingSettings struct {
 	// from the loaded workspace, never from a request or the database, hence
 	// excluded from the JSON. Without it, tokens are minted unsigned.
 	SigningKey []byte `json:"-"`
+	// SuppressOpens and SuppressClicks are this recipient's consent decisions:
+	// with EnableTracking on, the open pixel is left out when SuppressOpens is set
+	// and links are not wrapped in the click redirect when SuppressClicks is set.
+	// The UTM parameters are written either way. SuppressIdentify tells the senders
+	// that mint the web analytics identity token not to mint one; TrackLinks never
+	// reads it, an empty IdentifyToken already writes nothing. All three are
+	// decided per recipient at send time, so like the token they never reach a
+	// stored tracking_settings row.
+	SuppressOpens    bool `json:"-"`
+	SuppressClicks   bool `json:"-"`
+	SuppressIdentify bool `json:"-"`
+}
+
+// opensTracked reports whether the open pixel is written.
+func (t *TrackingSettings) opensTracked() bool {
+	return t.EnableTracking && !t.SuppressOpens
+}
+
+// clicksTracked reports whether links are wrapped in the click redirect.
+func (t *TrackingSettings) clicksTracked() bool {
+	return t.EnableTracking && !t.SuppressClicks
+}
+
+// isTrackingPreferenceLink reports whether sourceURL is a link to this
+// endpoint's notification center that opens the tracking preferences
+// (action=tracking) or the tracking opt-out (action=tracking_optout). Those
+// links are left exactly as written: withdrawing consent must not itself be
+// recorded as a click, and the link must reach the notification center without
+// UTM parameters or an identity token.
+func (t *TrackingSettings) isTrackingPreferenceLink(sourceURL string) bool {
+	if t.Endpoint == "" {
+		return false
+	}
+	// An href read out of the HTML keeps its &amp; references (see
+	// decodeHrefCharacterReferences), and the query cannot be read through them.
+	// It is read the way the click route reads a destination, so a link
+	// browsers open is recognised even when net/url refuses one of its escapes.
+	_, link := trackingtoken.ParseLenient(strings.ReplaceAll(sourceURL, "&amp;", "&"))
+	if link == nil {
+		return false
+	}
+	endpoint, err := url.Parse(t.Endpoint)
+	if err != nil || endpoint.Host == "" {
+		return false
+	}
+	if !strings.EqualFold(link.Host, endpoint.Host) {
+		return false
+	}
+	wantPath := strings.TrimRight(endpoint.Path, "/") + "/notification-center"
+	if strings.TrimRight(link.Path, "/") != wantPath {
+		return false
+	}
+	action := link.Query().Get("action")
+	return action == "tracking" || action == "tracking_optout"
 }
 
 // IsZero reports whether no field is set. Callers use it to tell "no tracking
@@ -211,7 +268,10 @@ func (t TrackingSettings) IsZero() bool {
 		t.MessageID == "" &&
 		t.IdentifyToken == "" &&
 		len(t.IdentifyAllowedHosts) == 0 &&
-		len(t.SigningKey) == 0
+		len(t.SigningKey) == 0 &&
+		!t.SuppressOpens &&
+		!t.SuppressClicks &&
+		!t.SuppressIdentify
 }
 
 // Value implements the driver.Valuer interface for database storage
@@ -366,9 +426,10 @@ func (t *TrackingSettings) applyUTMParameters(sourceURL string) string {
 		return sourceURL
 	}
 
-	// url.Parse is used to reject input that is not a URL at all. The string it
-	// would rebuild is never used.
-	if _, err := url.Parse(sourceURL); err != nil {
+	// The parse only rejects input that is not a URL at all; the string it would
+	// rebuild is never used. It repairs invalid escapes as browsers read them, so
+	// https://shop.com/50%off is tagged like any other link.
+	if _, err := trackingtoken.ParseRepaired(sourceURL); err != nil {
 		return sourceURL
 	}
 
@@ -514,9 +575,10 @@ func (t *TrackingSettings) applyIdentityParam(sourceURL string) string {
 		return sourceURL
 	}
 
-	// url.Parse is used to read the host for the allowlist gate and to reject
-	// input that is not a URL at all. The string it would rebuild is never used.
-	parsedURL, err := url.Parse(sourceURL)
+	// The parse reads the host for the allowlist gate and rejects input that is
+	// not a URL at all; the string it would rebuild is never used. Like
+	// applyUTMParameters it repairs invalid escapes, never in the host.
+	parsedURL, err := trackingtoken.ParseRepaired(sourceURL)
 	if err != nil {
 		return sourceURL
 	}
@@ -537,37 +599,6 @@ func (t *TrackingSettings) applyIdentityParam(sourceURL string) string {
 	// Only the value we add is escaped; the token is ours, everything else in
 	// the query is left byte-for-byte as it arrived.
 	return appendToRawQuery(sourceURL, WebIdentifyQueryParam+"="+url.QueryEscape(t.IdentifyToken))
-}
-
-func (t *TrackingSettings) GetTrackingURL(sourceURL string) string {
-	// The explicit per-notification opt-out suppresses everything, including
-	// UTM rewriting (single-use auth URLs must never be modified).
-	if t.TrackingMode == TrackingModeDisabled {
-		return sourceURL
-	}
-
-	// Ignore if URL is empty, a placeholder, mailto:, tel:, or already tracked (basic check)
-	if sourceURL == "" || strings.Contains(sourceURL, "{{") || strings.Contains(sourceURL, "{%") || strings.HasPrefix(sourceURL, "mailto:") || strings.HasPrefix(sourceURL, "tel:") {
-		return sourceURL
-	}
-
-	// Append UTM parameters to the destination URL
-	destinationURL := t.applyUTMParameters(sourceURL)
-
-	if !t.EnableTracking {
-		return destinationURL
-	}
-
-	// parse endpoint and add the UTM-augmented destination URL to the query params
-	parsedEndpoint, err := url.Parse(t.Endpoint)
-	if err != nil {
-		return sourceURL
-	}
-	endpointParams := parsedEndpoint.Query()
-	endpointParams.Add("url", destinationURL)
-	parsedEndpoint.RawQuery = endpointParams.Encode()
-
-	return parsedEndpoint.String()
 }
 
 // CompileTemplateRequest represents the request for compiling a template
@@ -1115,7 +1146,7 @@ func TrackLinks(htmlString string, trackingSettings TrackingSettings) (updatedHT
 	// return the original HTML. An identity token counts: a workspace can run web
 	// analytics with click tracking off, and the recipient still has to be
 	// identified on landing.
-	if !trackingSettings.EnableTracking && trackingSettings.UTMSource == "" &&
+	if !trackingSettings.opensTracked() && !trackingSettings.clicksTracked() && trackingSettings.UTMSource == "" &&
 		trackingSettings.UTMMedium == "" && trackingSettings.UTMCampaign == "" &&
 		trackingSettings.UTMContent == "" && trackingSettings.UTMTerm == "" &&
 		trackingSettings.IdentifyToken == "" {
@@ -1141,13 +1172,26 @@ func TrackLinks(htmlString string, trackingSettings TrackingSettings) (updatedHT
 		// The URL the recipient lands on: the attribute value with its
 		// character references read back as the characters they stand for. It
 		// is escaped again when written back below.
-		originalURL := decodeHrefCharacterReferences(rawValue)
+		//
+		// It is also preprocessed as browsers do (leading and trailing spaces
+		// trimmed, tab and line breaks removed), the way the click route and
+		// recorder read it too. Read raw, "https://shop.com/sale " got its UTM
+		// parameters after the space and sent the recipient to /sale%20, a
+		// leading space kept a link from being tagged at all, and " mailto:"
+		// was wrapped in a tracking redirect.
+		originalURL := trackingtoken.Preprocess(decodeHrefCharacterReferences(rawValue))
 
 		// Skip tracking for empty hrefs and special protocol links (mailto,
 		// tel, sms, etc.). These should not be wrapped in a redirect as it
 		// breaks their functionality
 		if isNonTrackableURL(originalURL) {
 			return rawValue // Return original link unchanged
+		}
+
+		// The tracking preference and opt-out links reach the notification
+		// center exactly as written; see isTrackingPreferenceLink.
+		if trackingSettings.isTrackingPreferenceLink(originalURL) {
+			return rawValue
 		}
 
 		// Append UTM parameters to the destination URL
@@ -1172,7 +1216,7 @@ func TrackLinks(htmlString string, trackingSettings TrackingSettings) (updatedHT
 
 		trackedURL := destinationURL
 
-		if trackingSettings.EnableTracking {
+		if trackingSettings.clicksTracked() {
 			// Use current Unix timestamp (seconds) for bot detection.
 			// The UTM-augmented destination URL is what gets encrypted into the
 			// token, so the redirect target preserves the UTM parameters.
@@ -1184,7 +1228,7 @@ func TrackLinks(htmlString string, trackingSettings TrackingSettings) (updatedHT
 		return escapeHrefForQuote(trackedURL, quote)
 	})
 
-	if trackingSettings.EnableTracking {
+	if trackingSettings.opensTracked() {
 		// Insert tracking pixel before </body>. The pixel is wrapped in a <table>
 		// by GenerateHTMLOpenTrackingPixel to look like a structural layout element
 		// rather than a standalone tracking pixel.

@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [43.0] - 2026-11-07
+
+- **Feature**: Contacts can now agree to or refuse open tracking and click tracking, each on its own. Their choice is stored on the contact (`tracking_opens_consent`, `tracking_clicks_consent`, with the date and source of the change), set through the API, the console, CSV import and the notification center, exported, filterable in the contact list and in segments, usable as an automation trigger field, and sent in contact webhooks. A contact who refused gets no open pixel or no tracked links, and a later refusal also stops recording opens and clicks of emails already sent.
+
+- **Feature**: Workspace settings now turn open tracking and click tracking on separately, and choose what happens for contacts whose choice is not recorded: track them (the default, as before) or not. Some regulators, such as the Italian Garante and the French CNIL, expect tracking to require consent; **if that applies to you, set "Contacts without recorded consent" to "Do not track"**.
+
+- **Feature**: The notification center says on one line whether email performance tracking is on for the contact, with a dialog where they make that choice. Templates can link to that dialog with `{{ tracking_preferences_url }}`, or offer a one-click refusal with `{{ tracking_optout_url }}`, which asks the contact to confirm before recording anything.
+
+- **Feature**: A broadcast can be sent without open and click tracking, keeping its UTM parameters. Transactional notifications get the same option (`tracking_mode: no_tracking`), next to `disabled`, which also leaves out UTM parameters.
+
+- **Improvement**: Open and click rates, in broadcast statistics, A/B test results, the analytics dashboard and per-link click rates, are now counted over the emails that were tracked, and their tooltip says how many when some were not. The automatic A/B winner is chosen the same way; when no variation has a tracked email for its metric, you pick the winner, and the console now offers that choice on every completed test, including those set to choose their winner automatically. Emails sent before the upgrade count as tracked, so their rates do not change.
+
+  Contact webhook payloads gain the four tracking consent fields; make sure a receiver that validates payloads accepts them.
+
+- **Improvement**: From this version on, automations carry contacts through more than ten steps in a row without a delay, and a journey interrupted between two steps, by a restart for instance, picks up again at the next step.
+
+- **Improvement**: When an email provider answers that emails arrive too fast, the email integration now slows down, then climbs back to its rate limit once emails go through. The refused email is sent again at the slower pace and keeps its attempts, and its broadcast keeps sending. A quota named in the refusal, or refusals that continue for 30 seconds at a tenth of the rate limit, pause the integration's broadcasts.
+
+- **Improvement**: A broadcast that also goes to the list's unsubscribed contacts ("Exclude unsubscribed recipients" switched off), for a security, outage or legal notice, no longer carries the List-Unsubscribe header, so mail clients show no Unsubscribe button on it. Draft and scheduled broadcasts are sent this way too; emails already queued before the upgrade, for a broadcast that is paused or still sending, keep the header. The unsubscribe link in your template is unchanged.
+
+  **Before you upgrade, check that this switch is on for your regular campaigns**, including those created through the API without `exclude_unsubscribed` before 42.0, which were saved with it off.
+
+- **Fix**: Links whose URL holds a `%` that starts no escape, such as `https://shop.com/50%off`, now get the UTM parameters and the web analytics identity token like any other link, and their clicks count in the per-link click statistics and segment link filters. These links already redirected and counted in the email's click total.
+
+- **Fix**: In emails sent from this version on, a link written with a space after its URL no longer gets its UTM parameters after the space, which sent the recipient to a different page, often a missing one. Links with a leading space or a line break inside now get their UTM parameters and identity token, and clicks on such links count per link, in emails already sent too. A `mailto:` or `tel:` link written with a leading space is no longer wrapped in a tracking redirect.
+
+- **Security**: The build tooling of the console, the notification center and the web analytics SDK now uses `minimatch` 11, which fixes a denial of service through crafted glob patterns ([GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249)). Neither runs in the shipped app. The console also moves to Lingui 6, whose translation tooling no longer uses a `glob` version that keeps reading the disk after its time limit ([GHSA-3g3m-2fjr-6pw4](https://github.com/advisories/GHSA-3g3m-2fjr-6pw4)); building the console now needs Node.js 22.19 or later.
+
 ## [42.2] - 2026-11-05
 
 - **Improvement**: Tracked links now ask the visitor to confirm before opening another site whenever Notifuse cannot verify that the email itself contained the link. Links in emails sent from now on carry that proof and redirect directly as before. Links in emails sent before the upgrade that lead to another site, legacy `/visit` links and links clicked from a template preview show a confirmation page naming the destination. Unsubscribe and notification center links keep working directly.
